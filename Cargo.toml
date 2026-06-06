@@ -1,0 +1,19 @@
+[package]
+name        = "poshtree"
+version     = "0.1.0"
+edition     = "2021"
+description = "PowerShell syntax tree: tokenizer, parser, AST, and unparser"
+license     = "MIT"
+keywords    = ["powershell", "parser", "ast", "lexer", "syntax-tree"]
+categories  = ["parser-implementations", "development-tools"]
+readme      = "README.md"
+homepage    = "https://farrim.re"
+repository  = "https://github.com/FarrimWildaxe/poshtree"
+
+# An empty `[workspace]` table makes this crate its own workspace root, so it
+# builds and tests in isolation and is not silently absorbed into the workspace
+# of any project it is vendored into.
+[workspace]
+
+[dependencies]
+regex = "1"
