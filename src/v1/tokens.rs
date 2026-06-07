@@ -13,7 +13,7 @@ use std::fmt;
 /// Every distinct syntactic category produced by the lexer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TokenType {
-    // --- literals ---
+    // Literals
     /// `$x`, `${a b}`, `$env:PATH`, `$global:y`, `$_`, `$?`
     Variable,
     /// `1`, `0xFF`, `1.5`, `1kb`, `1e3`
@@ -27,7 +27,7 @@ pub enum TokenType {
     /// `@" ... "@`
     HereStringDq,
 
-    // --- words ---
+    // Words
     /// Bareword / command name / argument (e.g. `Get-ChildItem`, `foo`)
     Generic,
     /// `if`, `foreach`, `function`, `return`, …
@@ -37,7 +37,7 @@ pub enum TokenType {
     /// `-eq`, `-and`, `+`, `=`, `-f`, `..`
     Operator,
 
-    // --- punctuation / structure ---
+    // Punctuation / structure
     Pipe,
     Amp,
     Semicolon,

@@ -50,27 +50,25 @@ fn decode_inner(data: &[u8]) -> String {
         return decode_utf16(rest, Endian::Big);
     }
     // No BOM: prefer UTF-8, but a high proportion of NUL bytes means the data is
-    // almost certainly UTF-16 that was saved without one.
+    // almost certainly UTF-16 that was saved without one. The count drives both
+    // the UTF-8 acceptance test and the UTF-16 fallback, so do it once.
+    let nul = data.iter().filter(|&&b| b == 0).count();
     if let Ok(s) = std::str::from_utf8(data) {
-        let nul = s.bytes().filter(|&b| b == 0).count();
         if nul == 0 || nul <= data.len() / 8 {
             return s.to_owned();
         }
     }
-    if data.len() >= 2 {
-        let nul = data.iter().filter(|&&b| b == 0).count();
-        if nul > data.len() / 8 {
-            // In ASCII-heavy UTF-16 the NULs sit on the high byte, so whether
-            // they fall on even or odd offsets reveals the endianness.
-            let even = data.iter().step_by(2).filter(|&&b| b == 0).count();
-            let odd = data.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
-            let endian = if even > odd {
-                Endian::Big
-            } else {
-                Endian::Little
-            };
-            return decode_utf16(data, endian);
-        }
+    if data.len() >= 2 && nul > data.len() / 8 {
+        // In ASCII-heavy UTF-16 the NULs sit on the high byte, so whether they
+        // fall on even or odd offsets reveals the endianness.
+        let even = data.iter().step_by(2).filter(|&&b| b == 0).count();
+        let odd = data.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
+        let endian = if even > odd {
+            Endian::Big
+        } else {
+            Endian::Little
+        };
+        return decode_utf16(data, endian);
     }
     // Last resort: keep the valid parts as UTF-8 instead of returning nothing.
     String::from_utf8_lossy(data).into_owned()
@@ -80,11 +78,14 @@ fn decode_inner(data: &[u8]) -> String {
 /// BOM, with a NUL-byte heuristic for BOM-less UTF-16.
 ///
 /// Invalid sequences are replaced with `U+FFFD` rather than rejected, and any
-/// leading BOM is removed, so the result is ready to pass straight to
-/// [`crate::parse`]. Encodings other than UTF-8 and UTF-16 (for example UTF-32)
-/// fall back to a lossy UTF-8 reading.
+/// leading BOM is removed, so the result is ready to pass straight to the
+/// lexer/parser (v1 or v2). Encodings other than UTF-8 and UTF-16 (for example
+/// UTF-32) fall back to a lossy UTF-8 reading.
 pub fn decode_bytes(data: &[u8]) -> String {
     let s = decode_inner(data);
+    // `decode_inner` already drops the BOM in every branch that could carry one
+    // (UTF-8 and both UTF-16 paths strip it). This is a backstop, and it avoids
+    // re-allocating on the common no-BOM path by returning `s` by move.
     match s.strip_prefix('\u{feff}') {
         Some(rest) => rest.to_owned(),
         None => s,

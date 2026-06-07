@@ -1,6 +1,6 @@
 [package]
 name        = "poshtree"
-version     = "0.1.0"
+version     = "0.2.0"
 edition     = "2021"
 description = "PowerShell syntax tree: tokenizer, parser, AST, and unparser"
 license     = "MIT"
@@ -15,5 +15,25 @@ repository  = "https://github.com/FarrimWildaxe/poshtree"
 # of any project it is vendored into.
 [workspace]
 
+[features]
+# v2 is the default front-end; v1 is opt-in.
+default = ["v2"]
+# The lossless layer: trivia-bearing tokens, byte spans, text edits, a native
+# recursive-descent parser, and a formatter. Zero dependencies.
+v2 = []
+# Legacy front-end: tokenizer, AST, parser, unparser. Off by default. Owns the
+# only dependency (`regex`, used by the v1 parser for Add-Type C# extraction;
+# no v2 code uses regex). `v2::tree` runs the v1 parser to recover token
+# ranges, so it needs this feature; regex tags along only as v1's internal
+# implementation detail.
+v1 = ["dep:regex"]
+
 [dependencies]
-regex = "1"
+regex = { version = "1", optional = true }
+
+# Standalone-v2 demo: PascalCase PowerShell command names via lex + native
+# parse + span edits. Requires only the `v2` feature, so it builds with
+# `--no-default-features --features v2`.
+[[example]]
+name = "pascalize"
+required-features = ["v2"]

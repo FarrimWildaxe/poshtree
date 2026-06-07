@@ -2309,7 +2309,7 @@ mod tests {
         // A lone closing brace forces error recovery, which slices the source;
         // with multi-byte input this must not panic.
         let (_, errors) = parse("café }");
-        // recovery happened (or not), but crucially we did not panic.
+        // whether or not recovery fired, reaching this line means no panic.
         let _ = errors;
     }
 

@@ -27,7 +27,7 @@ const INDENT: &str = "    ";
 
 /// Parse `source` and write the reconstructed PowerShell to `writer`.
 ///
-/// Mirrors [`dump_ast`](crate::engine::dump_ast) but emits runnable source
+/// Mirrors the host project's `dump_ast` but emits runnable source
 /// rather than an indented node tree. Parse errors are tolerated (the partial
 /// tree, with any `ErrorNode`s rendered from their raw text, is still emitted).
 pub fn dump_ast_to_ps1(source: &str, writer: &mut impl Write) {

@@ -936,7 +936,7 @@ impl AstNode {
 // Debug introspection (NodeInfo)
 
 /// Debug/introspection metadata for AST nodes, used by the `--dump-ast`
-/// renderer ([`dump_ast`](crate::engine::dump_ast)).
+/// renderer (the host project's `dump_ast`).
 ///
 /// Every node type reports its own [`label`](NodeInfo::label) (a short, stable
 /// name) and, for leaf/scalar nodes, a [`scalars`](NodeInfo::scalars) string
