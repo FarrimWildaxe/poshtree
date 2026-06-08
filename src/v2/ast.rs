@@ -54,6 +54,10 @@ pub struct CSharpImport {
 pub struct CSharpMemberDef {
     /// The raw C# source.
     pub code: String,
+    /// Source span of the raw C# body (between the string delimiters), so the
+    /// C# can be located in the original file. Drives the C# front-end and
+    /// any C#-aware refactoring.
+    pub code_span: Span,
     /// `[DllImport]` declarations found in the source.
     pub imports: Vec<CSharpImport>,
     /// Flat list of imported function names, for quick matching.

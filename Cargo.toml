@@ -1,6 +1,6 @@
 [package]
 name        = "poshtree"
-version     = "0.2.1"
+version     = "0.2.2"
 edition     = "2021"
 description = "PowerShell syntax tree: tokenizer, parser, AST, and unparser"
 license     = "MIT"
@@ -17,10 +17,13 @@ repository  = "https://github.com/FarrimWildaxe/poshtree"
 
 [features]
 # v2 is the default front-end; v1 is opt-in.
-default = ["v2"]
+default = ["v2", "csharp"]
 # The lossless layer: trivia-bearing tokens, byte spans, text edits, a native
 # recursive-descent parser, and a formatter. Zero dependencies.
 v2 = []
+# Self-contained C# front-end over Add-Type blocks (lexer, parser, resolver,
+# C#-aware refactors). Opt-in, builds on v2, zero runtime dependencies.
+csharp = ["v2"]
 # Legacy front-end: tokenizer, AST, parser, unparser. Off by default. Owns the
 # only dependency (`regex`, used by the v1 parser for Add-Type C# extraction;
 # no v2 code uses regex). `v2::tree` runs the v1 parser to recover token
@@ -37,3 +40,15 @@ regex = { version = "1", optional = true }
 [[example]]
 name = "pascalize"
 required-features = ["v2"]
+
+# Reads the C# in Add-Type blocks and prints the [DllImport] signatures and
+# declared types/methods/fields. Needs the C# front-end.
+[[example]]
+name = "pinvoke-report"
+required-features = ["csharp"]
+
+# Renames a C# type or member across the Add-Type block and its PowerShell call
+# sites in one pass. Needs the C# front-end.
+[[example]]
+name = "rename-native"
+required-features = ["csharp"]

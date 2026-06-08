@@ -159,6 +159,17 @@ impl Token {
         self.leading.iter().any(|t| t.kind == TriviaKind::Newline)
     }
 
+    /// True when a real (unescaped) newline sits in this token's *trailing*
+    /// trivia, so the next token opens a new physical line. The mirror of
+    /// [`starts_line`](Self::starts_line): a newline between two tokens can be
+    /// attached to either side, so to tell whether a line break sits here, check
+    /// the previous token's `ends_line` as well as the next token's
+    /// `starts_line`. A backtick continuation does not count, for the same
+    /// reason it does not count for `starts_line`.
+    pub fn ends_line(&self) -> bool {
+        self.trailing.iter().any(|t| t.kind == TriviaKind::Newline)
+    }
+
     /// Case-insensitive comparison of the raw token text, the way
     /// PowerShell compares keywords, command names, operators, and
     /// parameters.

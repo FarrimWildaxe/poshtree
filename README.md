@@ -86,6 +86,42 @@ signatures out of the inline C#, following a string through a variable
 assignment when it has to). It runs against a broad corpus and is fuzzed, so
 adversarial input recovers into error nodes rather than panicking.
 
+## C# in Add-Type
+
+`Add-Type` embeds C# inside a PowerShell string, and a type or method defined
+there is used back in PowerShell as ordinary syntax: `[Win32]`,
+`[Win32]::Beep(...)`, `New-Object Win32`. The optional `csharp` feature parses
+that C# into its own lossless tree, resolves it (scopes, shadowing, and
+references), and connects the two languages, so a rename moves both sides at
+once.
+
+```toml
+[dependencies]
+poshtree = { version = "0.1", features = ["csharp"] }
+```
+
+```rust
+use poshtree::v2::{parse, apply_edits};
+use poshtree::v2::csharp::rename_type;
+
+let src = "Add-Type -TypeDefinition @'\npublic class Win32 { }\n'@\n[Win32]::Beep(800, 200)\n$h = New-Object Win32\n";
+let out = parse(src);
+
+// Renames the C# declaration and every PowerShell use in one pass.
+let edits = rename_type(&out.script, src, "Win32", "NativeMethods");
+let fixed = apply_edits(src, &edits).unwrap();
+// class NativeMethods ... [NativeMethods]::Beep(800, 200) ... New-Object NativeMethods
+```
+
+`rename_member` does the same for a member and its `[Type]::Member` call sites,
+and `rename_csharp_field`, `_method`, `_local`, and `_parameter` rename within
+the C# alone. Resolution is single-file and case-correct, since C# is
+case-sensitive and PowerShell is not. A member access is renamed only when its
+receiver can mean that member: `this.Length`, or a static `Type.Length`, but
+never an unrelated `other.Length` whose type is unknown. With the feature on,
+the `[DllImport]` extraction above also reads from this parse rather than the
+fallback scanner. It adds no dependencies.
+
 ## Formatting
 
 `format_source` is a width-aware formatter built on the lossless tokens.
@@ -102,9 +138,11 @@ byte-for-byte. It refuses input that has syntax errors, and before returning
 it re-lexes and re-parses its own output to confirm the program is unchanged.
 If that check fails you get an error instead of altered code.
 
-## Example: pascalize
+## Examples
 
-The `pascalize` example is a small codemod. It parses with `parse`, finds
+The `examples/` directory has three runnable programs.
+
+`pascalize` is a small codemod on the `v2` layer. It parses with `parse`, finds
 command names, and rewrites each to PascalCase through `apply_edits`, touching
 only the name tokens and leaving comments, strings, arguments, and layout
 intact.
@@ -113,6 +151,24 @@ intact.
 $ cargo run --example pascalize           # built-in demo
 $ cargo run --example pascalize -- file.ps1
 $ cat file.ps1 | cargo run --example pascalize -- -
+```
+
+`pinvoke-report` uses the `csharp` feature to read the C# in each `Add-Type`
+block and print its `[DllImport]` signatures and declared types, methods, and
+fields. It only reads the script.
+
+```console
+$ cargo run --features csharp --example pinvoke-report           # built-in demo
+$ cargo run --features csharp --example pinvoke-report -- file.ps1
+```
+
+`rename-native` uses the `csharp` feature to rename a C# type or member across
+both the `Add-Type` block and its PowerShell call sites in one pass.
+
+```console
+$ cargo run --features csharp --example rename-native            # built-in demo
+$ cat file.ps1 | cargo run --features csharp --example rename-native -- type Win32 NativeApi
+$ cat file.ps1 | cargo run --features csharp --example rename-native -- member Win32 MessageBox ShowMessage
 ```
 
 ## Versioning

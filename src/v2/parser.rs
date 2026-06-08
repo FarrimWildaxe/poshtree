@@ -125,7 +125,9 @@ struct Parser<'a> {
     depth: u32,
     /// `$plainvar = "literal"` assignments, for recovering inline C# handed to
     /// `Add-Type` through a variable.
-    vars: std::collections::HashMap<String, String>,
+    /// `$plainvar = "literal"` assignments, for recovering inline C# handed to
+    /// `Add-Type` through a variable. Stores the body and its source span.
+    vars: std::collections::HashMap<String, (String, Span)>,
 }
 
 /// Guards against pathological nesting blowing the stack on adversarial input.
@@ -162,8 +164,20 @@ impl Parser<'_> {
         self.at(T::Operator) && self.value() == op
     }
 
+    /// Whether a real line break sits immediately before the current token.
+    /// A newline between two tokens may be attached to the previous token's
+    /// trailing trivia or this token's leading trivia (a here-string, for one,
+    /// keeps its closing newline as trailing trivia), so a correct statement
+    /// boundary check looks at both sides. Backtick continuations are
+    /// `LineContinuation`, not `Newline`, so they correctly do not count.
     fn starts_line(&self) -> bool {
-        self.tokens[self.pos].starts_line()
+        let here = self.tokens[self.pos].starts_line();
+        let prev = self
+            .pos
+            .checked_sub(1)
+            .and_then(|i| self.tokens.get(i))
+            .is_some_and(|t| t.ends_line());
+        here || prev
     }
 
     /// Consumes the current token and returns its index. Never advances past
@@ -405,7 +419,10 @@ impl Parser<'_> {
                         if !n.contains(':') && !n.starts_with('{') {
                             self.vars.insert(
                                 n.to_ascii_lowercase(),
-                                string_inner(sv, *kind).to_string(),
+                                (
+                                    string_inner(sv, *kind).to_string(),
+                                    body_span(sv, *kind, value.span),
+                                ),
                             );
                         }
                     }
@@ -523,9 +540,10 @@ impl Parser<'_> {
         if !cmd.eq_ignore_ascii_case("add-type") {
             return None;
         }
-        let (code, parameter) = find_csharp_code(elements, &self.vars)?;
+        let (code, parameter, code_span) = find_csharp_code(elements, &self.vars)?;
         let mut def = parse_csharp_member_def(&code);
         def.parameter = parameter;
+        def.code_span = code_span;
         Some(Box::new(Node {
             kind: NodeKind::CSharpMemberDef(def),
             span: self.span_of(start, self.pos),
@@ -1360,6 +1378,13 @@ impl Parser<'_> {
 
     fn parse_postfix_from(&mut self, mut node: Node, start: usize) -> Node {
         loop {
+            // A newline ends the statement: a postfix operator (`.`, `::`, `[`,
+            // `(`, `++`) on the next line is a new statement, not a suffix on
+            // this value. Backtick continuations are LineContinuation trivia,
+            // not Newline, so they do not trip this and the chain continues.
+            if self.starts_line() {
+                break;
+            }
             let null_dot = self.at(T::Operator) && self.value() == "?.";
             let null_index = self.at(T::Operator) && self.value() == "?[";
             if self.at(T::Dot) || self.at(T::DoubleColon) || null_dot {
@@ -1522,7 +1547,8 @@ impl Parser<'_> {
             // Guard against pathological interpolation nesting on adversarial
             // input; real code never approaches this depth.
             if inner.contains('$') && self.depth < 64 {
-                extract_interpolations(inner, span, i)
+                let base = body_span(&value, kind, span).start;
+                extract_interpolations(inner, base, i)
             } else {
                 Vec::new()
             }
@@ -1711,13 +1737,25 @@ fn match_var_ref(chars: &[char]) -> Option<usize> {
 /// Extracts interpolation nodes (`$var`, `${name}`, `$(...)`) from the body of
 /// an expandable string, mirroring v1. Parts share the string's span and an
 /// empty token range, since their bytes are owned by the string token.
-fn extract_interpolations(inner: &str, span: Span, idx: usize) -> Vec<Node> {
+fn extract_interpolations(inner: &str, base: usize, idx: usize) -> Vec<Node> {
     let range = TokenRange {
         first: idx,
         end: idx,
     };
     let chars: Vec<char> = inner.chars().collect();
     let n = chars.len();
+    // Byte offset within `inner` for each char index, with a sentinel at n, so
+    // a char range maps to an absolute source span via `base`.
+    let mut boff = Vec::with_capacity(n + 1);
+    {
+        let mut b = 0usize;
+        for c in &chars {
+            boff.push(b);
+            b += c.len_utf8();
+        }
+        boff.push(b);
+    }
+    let span_at = |a: usize, z: usize| Span::new(base + boff[a], base + boff[z]);
     let mut parts = Vec::new();
     let mut i = 0;
     while i < n {
@@ -1743,9 +1781,10 @@ fn extract_interpolations(inner: &str, span: Span, idx: usize) -> Vec<Node> {
             }
             let sub_src: String = chars[i + 2..j.min(n)].iter().collect();
             let script = parse(&sub_src).script;
+            let end = (j + 1).min(n);
             parts.push(Node {
                 kind: NodeKind::SubExpression(Box::new(script)),
-                span,
+                span: span_at(i, end),
                 range,
             });
             i = j + 1;
@@ -1756,7 +1795,7 @@ fn extract_interpolations(inner: &str, span: Span, idx: usize) -> Vec<Node> {
                 let raw: String = chars[i..i + consumed].iter().collect();
                 parts.push(Node {
                     kind: NodeKind::Variable(raw),
-                    span,
+                    span: span_at(i, i + consumed),
                     range,
                 });
                 i += consumed;
@@ -1766,6 +1805,21 @@ fn extract_interpolations(inner: &str, span: Span, idx: usize) -> Vec<Node> {
         i += 1;
     }
     parts
+}
+
+/// Source span of a string's body (what [`string_inner`] returns) given the
+/// token's full span, so interpolation parts and Add-Type C# get spans that
+/// point at the real bytes rather than the whole string token.
+fn body_span(value: &str, kind: StringKind, span: Span) -> Span {
+    let inner = string_inner(value, kind);
+    let off = subslice_offset(value, inner);
+    Span::new(span.start + off, span.start + off + inner.len())
+}
+
+/// Byte offset of `inner` within `outer`. `inner` must be a subslice of
+/// `outer`, as produced by `str::strip_prefix`/`strip_suffix`.
+fn subslice_offset(outer: &str, inner: &str) -> usize {
+    (inner.as_ptr() as usize) - (outer.as_ptr() as usize)
 }
 
 fn strip_param_dash(param: &str) -> String {
@@ -1783,12 +1837,17 @@ fn lex_error_span(_e: &LexError) -> Span {
 
 use std::collections::HashMap;
 
-use super::ast::{CSharpImport, CSharpMemberDef, CSharpParam};
+#[cfg(not(feature = "csharp"))]
+use super::ast::CSharpParam;
+use super::ast::{CSharpImport, CSharpMemberDef};
 
 /// Locates the C# source handed to `Add-Type`: the argument of a
 /// `-TypeDefinition`/`-MemberDefinition` parameter (prefix-matched), or the
 /// first positional string or resolvable variable. Returns `(code, label)`.
-fn find_csharp_code(elements: &[Node], vars: &HashMap<String, String>) -> Option<(String, String)> {
+fn find_csharp_code(
+    elements: &[Node],
+    vars: &HashMap<String, (String, Span)>,
+) -> Option<(String, String, Span)> {
     const CSHARP_PARAMS: [&str; 2] = ["memberdefinition", "typedefinition"];
     for (i, el) in elements.iter().enumerate() {
         let NodeKind::CommandParameter { name, argument } = &el.kind else {
@@ -1802,26 +1861,29 @@ fn find_csharp_code(elements: &[Node], vars: &HashMap<String, String>) -> Option
             Some(e) if !matches!(e.kind, NodeKind::CommandParameter { .. }) => Some(e),
             _ => None,
         });
-        if let Some(code) = value.and_then(|v| as_csharp_code(v, vars)) {
-            return Some((code, pname));
+        if let Some((code, span)) = value.and_then(|v| as_csharp_code(v, vars)) {
+            return Some((code, pname, span));
         }
     }
     for el in elements {
         if matches!(el.kind, NodeKind::CommandParameter { .. }) {
             continue;
         }
-        if let Some(code) = as_csharp_code(el, vars) {
-            return Some((code, "positional".to_string()));
+        if let Some((code, span)) = as_csharp_code(el, vars) {
+            return Some((code, "positional".to_string(), span));
         }
     }
     None
 }
 
-/// A string literal's body, or an unscoped variable resolved to the string it
-/// was assigned earlier in the script.
-fn as_csharp_code(node: &Node, vars: &HashMap<String, String>) -> Option<String> {
+/// A string literal's body (with its source span), or an unscoped variable
+/// resolved to the string it was assigned earlier in the script.
+fn as_csharp_code(node: &Node, vars: &HashMap<String, (String, Span)>) -> Option<(String, Span)> {
     match &node.kind {
-        NodeKind::StringLiteral { value, kind, .. } => Some(string_inner(value, *kind).to_string()),
+        NodeKind::StringLiteral { value, kind, .. } => Some((
+            string_inner(value, *kind).to_string(),
+            body_span(value, *kind, node.span),
+        )),
         NodeKind::Variable(raw) => {
             let n = raw.trim_start_matches('$');
             if n.contains(':') || n.starts_with('{') {
@@ -1836,6 +1898,29 @@ fn as_csharp_code(node: &Node, vars: &HashMap<String, String>) -> Option<String>
 
 /// Parses inline C# for `[DllImport]` P/Invoke declarations.
 fn parse_csharp_member_def(code: &str) -> CSharpMemberDef {
+    let (imports, apis) = extract_imports_apis(code);
+    CSharpMemberDef {
+        code: code.to_string(),
+        // The caller (maybe_csharp) fills this with the real source span; this
+        // path only has the extracted text.
+        code_span: Span::default(),
+        imports,
+        apis,
+        parameter: String::new(),
+    }
+}
+
+/// With the C# front-end compiled in, read imports from the real parse tree.
+#[cfg(feature = "csharp")]
+fn extract_imports_apis(code: &str) -> (Vec<CSharpImport>, Vec<String>) {
+    let unit = crate::v2::csharp::parser::cs_parse(code, 0);
+    crate::v2::csharp::imports::csharp_imports_and_apis(&unit, code)
+}
+
+/// Without it, a lightweight scanner finds `[DllImport]` signatures, so the
+/// default build still populates imports with no extra dependency or parser.
+#[cfg(not(feature = "csharp"))]
+fn extract_imports_apis(code: &str) -> (Vec<CSharpImport>, Vec<String>) {
     let mut imports = Vec::new();
     let mut apis = Vec::new();
     let n = code.len();
@@ -1849,17 +1934,13 @@ fn parse_csharp_member_def(code: &str) -> CSharpMemberDef {
             i += 1;
         }
     }
-    CSharpMemberDef {
-        code: code.to_string(),
-        imports,
-        apis,
-        parameter: String::new(),
-    }
+    (imports, apis)
 }
 
 /// Tries to match `[DllImport("dll" ...)] <modifiers> <ret> <fn>(<params>)`
 /// starting at byte `i`, returning the import and the byte offset just past the
 /// parameter list. Mirrors v1's `DLLIMPORT_RE` plus `balanced_parens`.
+#[cfg(not(feature = "csharp"))]
 fn try_match_dllimport(code: &str, i: usize) -> Option<(CSharpImport, usize)> {
     let b = code.as_bytes();
     let n = b.len();
@@ -1952,6 +2033,7 @@ fn try_match_dllimport(code: &str, i: usize) -> Option<(CSharpImport, usize)> {
     ))
 }
 
+#[cfg(not(feature = "csharp"))]
 fn parse_cs_params(param_str: &str) -> Vec<CSharpParam> {
     const MODS: [&str; 7] = ["ref", "out", "in", "params", "this", "readonly", "scoped"];
     split_top_level(param_str, ',')
@@ -1979,6 +2061,7 @@ fn parse_cs_params(param_str: &str) -> Vec<CSharpParam> {
 }
 
 /// Replaces `[Attr...]` attribute spans with a space, as v1's `CS_ATTR_RE` does.
+#[cfg(not(feature = "csharp"))]
 fn strip_cs_attrs(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
@@ -2010,6 +2093,7 @@ fn strip_cs_attrs(s: &str) -> String {
 
 /// Splits `s` on `sep` at top level, ignoring separators inside quotes or
 /// nested brackets. Empty (whitespace-only) pieces are dropped.
+#[cfg(not(feature = "csharp"))]
 fn split_top_level(s: &str, sep: char) -> Vec<String> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
@@ -2046,6 +2130,7 @@ fn split_top_level(s: &str, sep: char) -> Vec<String> {
 
 /// From a byte offset just past `(`, returns the balanced-paren contents and
 /// the offset just past the matching `)`.
+#[cfg(not(feature = "csharp"))]
 fn balanced_parens(code: &str, start: usize) -> (String, usize) {
     let mut depth = 1usize;
     for (off, c) in code[start..].char_indices() {
@@ -2063,6 +2148,7 @@ fn balanced_parens(code: &str, start: usize) -> (String, usize) {
     (code[start..].to_string(), code.len())
 }
 
+#[cfg(not(feature = "csharp"))]
 fn skip_ws_b(b: &[u8], mut i: usize) -> usize {
     while i < b.len() && b[i].is_ascii_whitespace() {
         i += 1;
@@ -2070,22 +2156,27 @@ fn skip_ws_b(b: &[u8], mut i: usize) -> usize {
     i
 }
 
+#[cfg(not(feature = "csharp"))]
 fn matches_ci(b: &[u8], i: usize, kw: &[u8]) -> bool {
     i + kw.len() <= b.len() && b[i..i + kw.len()].eq_ignore_ascii_case(kw)
 }
 
+#[cfg(not(feature = "csharp"))]
 fn is_alpha_b(c: u8) -> bool {
     c.is_ascii_alphabetic()
 }
 
+#[cfg(not(feature = "csharp"))]
 fn is_word_b(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
+#[cfg(not(feature = "csharp"))]
 fn is_ret_char_b(c: u8) -> bool {
     is_word_b(c) || matches!(c, b'.' | b'<' | b'>' | b'[' | b']')
 }
 
+#[cfg(not(feature = "csharp"))]
 fn match_cs_modifier(b: &[u8], i: usize) -> Option<usize> {
     const MODS: [&[u8]; 7] = [
         b"public",
@@ -2335,6 +2426,35 @@ mod tests {
                 assert!(csharp.is_none());
             }
         });
+    }
+
+    #[test]
+    fn interpolation_parts_have_precise_spans() {
+        // The variable inside a double-quoted string must point at its own
+        // bytes, not at the whole string, so refactors can rewrite it.
+        let src = "Write-Output \"hello $name and ${other}\"\n";
+        let out = parse(src);
+        let mut hits: Vec<String> = Vec::new();
+        out.script.walk(&mut |n| {
+            if let NodeKind::Variable(_) = &n.kind {
+                hits.push(n.span.slice(src).to_string());
+            }
+        });
+        assert_eq!(hits, vec!["$name".to_string(), "${other}".to_string()]);
+
+        // The same must hold inside a here-string, where the body offset is
+        // past `@"` and the leading newline.
+        let src2 = "$x = @\"\nval=$count\n\"@\n";
+        let out2 = parse(src2);
+        let mut found = None;
+        out2.script.walk(&mut |n| {
+            if let NodeKind::Variable(raw) = &n.kind {
+                if raw == "$count" {
+                    found = Some(n.span.slice(src2).to_string());
+                }
+            }
+        });
+        assert_eq!(found.as_deref(), Some("$count"));
     }
 
     #[test]

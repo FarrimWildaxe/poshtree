@@ -162,6 +162,8 @@
 //! `scope`, `splat`) are derived from `value` on demand.
 
 pub mod ast;
+#[cfg(feature = "csharp")]
+pub mod csharp;
 pub mod edit;
 pub mod formatter;
 pub mod lexer;
