@@ -16,7 +16,7 @@ editor tooling. It has no dependencies.
 
 ```toml
 [dependencies]
-poshtree = "0.1"
+poshtree = "0.2.2"
 ```
 
 Or point at a local checkout:
@@ -97,7 +97,7 @@ once.
 
 ```toml
 [dependencies]
-poshtree = { version = "0.1", features = ["csharp"] }
+poshtree = { version = "0.2.2", features = ["csharp"] }
 ```
 
 ```rust
