@@ -33,22 +33,64 @@ pub struct ParseError {
     pub span: Span,
 }
 
-/// The result of [`parse`]: the tree root (always a [`NodeKind::Script`]) and
-/// any errors encountered (lexer errors first, then parser errors).
+/// The result of [`parse`]: the tree root (always a [`NodeKind::Script`]),
+/// any errors encountered (lexer errors first, then parser errors), and the
+/// token stream the tree was built from.
 #[derive(Debug, Clone)]
 pub struct ParseOutput {
     /// The script-block root.
     pub script: Node,
     /// Recoverable errors; an empty vector means a clean parse.
     pub errors: Vec<ParseError>,
+    /// The tokens the tree was built from, handed back so a caller that also
+    /// needs them (a formatter, an analyzer) does not have to lex a second
+    /// time. With [`parse`] these come from the internal [`lex`] call; with
+    /// [`parse_tokens`] they are the tokens passed in.
+    pub tokens: Vec<Token>,
 }
 
 /// Parses PowerShell source into a v2 syntax tree.
+///
+/// This lexes internally. If you have already lexed `src` (to inspect tokens,
+/// reconstruct, or check lex errors), call [`parse_tokens`] instead to avoid
+/// lexing twice; either way the tokens come back on [`ParseOutput::tokens`].
 pub fn parse(src: &str) -> ParseOutput {
     let lexed = lex(src);
-    let mut errors: Vec<ParseError> = lexed.errors.iter().map(ParseError::from_lex).collect();
+    let lex_errors: Vec<ParseError> = lexed.errors.iter().map(ParseError::from_lex).collect();
+    let mut out = parse_tokens(src, lexed.tokens);
+    if !lex_errors.is_empty() {
+        // Lexer errors come first, ahead of the parser errors already in `out`.
+        let mut errors = lex_errors;
+        errors.append(&mut out.errors);
+        out.errors = errors;
+    }
+    out
+}
+
+/// Parses tokens that were already produced by [`lex`] over the same `src`,
+/// without lexing again.
+///
+/// `src` must be the exact string the tokens were lexed from: the parser
+/// reads it through the token spans (for example to capture a bracketed type
+/// name spanning several tokens), so a mismatched `src` gives wrong spans or
+/// panics. Lexer errors are not represented here; inspect [`LexOutput::errors`]
+/// from your own `lex` call. The returned [`ParseOutput`] carries the tokens
+/// back unchanged.
+///
+/// ```
+/// use poshtree::v2::{lex, parse_tokens, reconstruct};
+///
+/// let src = "Get-ChildItem | Sort-Object\n";
+/// let lexed = lex(src); // lex once
+/// let out = parse_tokens(src, lexed.tokens);
+/// assert!(out.errors.is_empty());
+/// assert_eq!(reconstruct(&out.tokens), src); // tokens handed back, no re-lex
+/// ```
+///
+/// [`LexOutput::errors`]: super::lexer::LexOutput::errors
+pub fn parse_tokens(src: &str, tokens: Vec<Token>) -> ParseOutput {
     let mut parser = Parser {
-        tokens: lexed.tokens,
+        tokens,
         src,
         pos: 0,
         errors: Vec::new(),
@@ -58,8 +100,12 @@ pub fn parse(src: &str) -> ParseOutput {
     let body = parser.parse_block_body(&[]);
     let end = parser.pos;
     let script = parser.make(NodeKind::Script(body), 0, end);
-    errors.append(&mut parser.errors);
-    ParseOutput { script, errors }
+    let Parser { tokens, errors, .. } = parser;
+    ParseOutput {
+        script,
+        errors,
+        tokens,
+    }
 }
 
 impl ParseError {
@@ -2289,6 +2335,29 @@ mod tests {
                 assert!(csharp.is_none());
             }
         });
+    }
+
+    #[test]
+    fn parse_tokens_matches_parse_and_hands_tokens_back() {
+        let src = "function Get-Thing { param([int]$n) $n + 1 }\nGet-Thing -n 2 | Write-Output\n";
+
+        // parse() lexes internally.
+        let from_src = parse(src);
+        // parse_tokens() parses tokens lexed once by the caller.
+        let lexed = crate::v2::lex(src);
+        let from_tokens = parse_tokens(src, lexed.tokens);
+
+        // Same tree and same errors regardless of entry point.
+        assert_eq!(from_src.errors, from_tokens.errors);
+        assert_eq!(
+            format!("{:?}", from_src.script),
+            format!("{:?}", from_tokens.script)
+        );
+
+        // Both hand the tokens back, and they reconstruct the source exactly,
+        // so a caller that also needs tokens never has to lex twice.
+        assert_eq!(crate::v2::reconstruct(&from_src.tokens), src);
+        assert_eq!(crate::v2::reconstruct(&from_tokens.tokens), src);
     }
 
     #[test]

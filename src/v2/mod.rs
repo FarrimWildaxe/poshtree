@@ -176,7 +176,7 @@ pub use ast::{CSharpImport, CSharpMemberDef, CSharpParam, Node, NodeKind, String
 pub use edit::{apply_edits, EditError, TextEdit};
 pub use formatter::{format_source, format_source_with, FormatError, FormatOptions};
 pub use lexer::{lex, LexOutput};
-pub use parser::{parse, ParseError, ParseOutput};
+pub use parser::{parse, parse_tokens, ParseError, ParseOutput};
 pub use span::{LineCol, LineIndex, Span, TokenRange};
 pub use tokens::{LexError, Token, TokenKind};
 #[cfg(feature = "v1")]

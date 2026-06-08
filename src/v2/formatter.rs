@@ -94,26 +94,31 @@ pub fn format_source(src: &str) -> Result<String, FormatError> {
 /// what is normalized, what is preserved, and the safety guarantees.
 pub fn format_source_with(src: &str, options: &FormatOptions) -> Result<String, FormatError> {
     let lexed = super::lex(src);
-    let parsed = super::parse(src);
-    if !lexed.errors.is_empty() || !parsed.errors.is_empty() {
-        let mut errors: Vec<String> = lexed.errors.iter().map(|e| e.to_string()).collect();
-        errors.extend(parsed.errors.iter().map(|e| e.message.clone()));
+    if !lexed.errors.is_empty() {
+        let errors = lexed.errors.iter().map(|e| e.to_string()).collect();
+        return Err(FormatError::Syntax { errors });
+    }
+    // Parse from the tokens just produced rather than lexing a second time;
+    // `parse_tokens` hands them back on `ParseOutput::tokens` for the emitter.
+    let parsed = super::parse_tokens(src, lexed.tokens);
+    if !parsed.errors.is_empty() {
+        let errors = parsed.errors.iter().map(|e| e.message.clone()).collect();
         return Err(FormatError::Syntax { errors });
     }
 
-    let doc = Emitter::new(&lexed.tokens).file();
+    let doc = Emitter::new(&parsed.tokens).file();
     let mut out = print(&doc, options);
     // Prefer ending with a newline, but only keep it when the result still
     // verifies: the convenience byte must never change the program.
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
-        if verify_equivalent(&lexed.tokens, &parsed.script, &out).is_ok() {
+        if verify_equivalent(&parsed.tokens, &parsed.script, &out).is_ok() {
             return Ok(out);
         }
         out.pop();
     }
 
-    verify_equivalent(&lexed.tokens, &parsed.script, &out)?;
+    verify_equivalent(&parsed.tokens, &parsed.script, &out)?;
     Ok(out)
 }
 
@@ -127,8 +132,7 @@ fn verify_equivalent(
     output: &str,
 ) -> Result<(), FormatError> {
     let out_lexed = super::lex(output);
-    let out_parsed = super::parse(output);
-    if !out_lexed.errors.is_empty() || !out_parsed.errors.is_empty() {
+    if !out_lexed.errors.is_empty() {
         return Err(FormatError::Unsafe {
             reason: "formatted output no longer parses cleanly".into(),
         });
@@ -143,6 +147,13 @@ fn verify_equivalent(
     if significant(input_tokens) != significant(&out_lexed.tokens) {
         return Err(FormatError::Unsafe {
             reason: "token sequence changed".into(),
+        });
+    }
+    // Reuse the tokens just compared for the parse, again avoiding a re-lex.
+    let out_parsed = super::parse_tokens(output, out_lexed.tokens);
+    if !out_parsed.errors.is_empty() {
+        return Err(FormatError::Unsafe {
+            reason: "formatted output no longer parses cleanly".into(),
         });
     }
     if !same_shape(input_root, &out_parsed.script) {
