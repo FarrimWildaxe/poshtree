@@ -323,10 +323,7 @@ impl Builder {
             if let Some(id) = self.scopes[scope].names.get(name) {
                 return Some(*id);
             }
-            match self.scopes[scope].parent {
-                Some(p) => scope = p,
-                None => return None,
-            }
+            scope = self.scopes[scope].parent?;
         }
     }
 
