@@ -80,15 +80,12 @@ pub fn rename_member(
 
 fn ps_type_refs(scope: &Node, src: &str, from: &str, out: &mut Vec<Span>) {
     scope.walk(&mut |n| match &n.kind {
-        NodeKind::TypeExpression(_) => {
-            // Inside the brackets: `[ ... ]`.
-            if n.span.end > n.span.start + 1 {
-                let inner_start = n.span.start + 1;
-                let inner_end = n.span.end - 1;
-                if let Some(s) = name_segment_span(&src[inner_start..inner_end], inner_start, from)
-                {
-                    out.push(s);
-                }
+        // Inside the brackets: `[ ... ]`.
+        NodeKind::TypeExpression(_) if n.span.end > n.span.start + 1 => {
+            let inner_start = n.span.start + 1;
+            let inner_end = n.span.end - 1;
+            if let Some(s) = name_segment_span(&src[inner_start..inner_end], inner_start, from) {
+                out.push(s);
             }
         }
         NodeKind::Cast { .. } => {
@@ -169,15 +166,15 @@ fn new_object_type_arg(elements: &[Node]) -> Option<&Node> {
     let mut i = 0;
     while i < elements.len() {
         match &elements[i].kind {
-            NodeKind::CommandParameter { name, argument } => {
-                if "typename".starts_with(&name.to_ascii_lowercase()) {
-                    if let Some(arg) = argument {
-                        return Some(arg);
-                    }
-                    if let Some(next) = elements.get(i + 1) {
-                        if !matches!(next.kind, NodeKind::CommandParameter { .. }) {
-                            return Some(next);
-                        }
+            NodeKind::CommandParameter { name, argument }
+                if "typename".starts_with(&name.to_ascii_lowercase()) =>
+            {
+                if let Some(arg) = argument {
+                    return Some(arg);
+                }
+                if let Some(next) = elements.get(i + 1) {
+                    if !matches!(next.kind, NodeKind::CommandParameter { .. }) {
+                        return Some(next);
                     }
                 }
             }
