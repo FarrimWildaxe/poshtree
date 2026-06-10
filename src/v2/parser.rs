@@ -802,6 +802,7 @@ impl Parser<'_> {
     fn parse_function(&mut self, filter: bool) -> Node {
         let start = self.pos;
         self.bump();
+        let name_pos = self.pos;
         let name = if self.at(T::Generic) || self.at(T::Keyword) {
             let v = self.value().to_string();
             self.bump();
@@ -810,10 +811,12 @@ impl Parser<'_> {
             self.error("expected function name");
             String::new()
         };
+        let name_span = self.span_of(name_pos, self.pos);
         let body = self.parse_braced_block();
         self.make(
             NodeKind::Function {
                 name,
+                name_span,
                 filter,
                 body: Box::new(body),
             },
@@ -1780,7 +1783,14 @@ fn extract_interpolations(inner: &str, base: usize, idx: usize) -> Vec<Node> {
                 j += 1;
             }
             let sub_src: String = chars[i + 2..j.min(n)].iter().collect();
-            let script = parse(&sub_src).script;
+            let mut script = parse(&sub_src).script;
+            // `parse` returns spans relative to `sub_src` (base 0). Lift them to
+            // absolute source offsets: `sub_src` begins at the byte after `$(`,
+            // i.e. `base + boff[i + 2]`. Without this, a variable inside the
+            // sub-expression keeps a sub_src-relative span and points at the
+            // wrong bytes (or, worse, at coincidentally matching ones).
+            let delta = base + boff[i + 2];
+            rebase(&mut script, delta, range);
             let end = (j + 1).min(n);
             parts.push(Node {
                 kind: NodeKind::SubExpression(Box::new(script)),
@@ -1805,6 +1815,17 @@ fn extract_interpolations(inner: &str, base: usize, idx: usize) -> Vec<Node> {
         i += 1;
     }
     parts
+}
+
+/// Shifts every span in `node` by `delta` and pins its token range to `range`.
+/// Used to lift a sub-expression that was parsed from a detached substring
+/// (offsets relative to that substring) into the coordinates of the original
+/// source. The token range is set to the string token's placeholder, since the
+/// sub-expression's tokens are not part of the outer token stream.
+fn rebase(node: &mut Node, delta: usize, range: TokenRange) {
+    node.span = Span::new(node.span.start + delta, node.span.end + delta);
+    node.range = range;
+    node.for_each_child_mut(&mut |child| rebase(child, delta, range));
 }
 
 /// Source span of a string's body (what [`string_inner`] returns) given the
@@ -2458,6 +2479,106 @@ mod tests {
     }
 
     #[test]
+    fn subexpression_interpolation_variable_has_correct_span() {
+        // Regression for the $(...) span bug: a variable inside a sub-expression
+        // interpolation must point at its own bytes. Before the fix this sliced
+        // to "Write" (the sub_src-relative span [0,5] read against the source).
+        let src = "Write-Output \"x $($file.Name) y\"\n";
+        let out = parse(src);
+        let mut slices = Vec::new();
+        out.script.walk(&mut |n| {
+            if let NodeKind::Variable(name) = &n.kind {
+                if name == "$file" {
+                    slices.push(n.span.slice(src).to_string());
+                }
+            }
+        });
+        assert_eq!(slices, vec!["$file".to_string()]);
+    }
+
+    #[test]
+    fn subexpression_interpolation_span_is_not_a_coincidence() {
+        // The dangerous case: the buggy span happened to slice to a real `$q`
+        // elsewhere, so a slice-only check passes. Assert on the byte offset.
+        let src = "$q = 1\n\"hi $($q.X)\"\n";
+        let out = parse(src);
+        let mut starts = Vec::new();
+        out.script.walk(&mut |n| {
+            if let NodeKind::Variable(name) = &n.kind {
+                if name == "$q" {
+                    starts.push(n.span.start);
+                }
+            }
+        });
+        // The assignment's $q is at byte 0; the interpolated $q is at byte 13.
+        assert!(
+            starts.contains(&0),
+            "assignment $q at byte 0, got {starts:?}"
+        );
+        assert!(
+            starts.contains(&13),
+            "interpolated $q at byte 13, got {starts:?}"
+        );
+        assert_eq!(&src[13..15], "$q");
+    }
+
+    #[test]
+    fn two_subexpressions_get_distinct_spans() {
+        let src = "Write-Output \"z $($a.B) $($c) w\"\n";
+        let out = parse(src);
+        let mut found = std::collections::HashMap::new();
+        out.script.walk(&mut |n| {
+            if let NodeKind::Variable(name) = &n.kind {
+                found.insert(name.clone(), n.span.slice(src).to_string());
+            }
+        });
+        assert_eq!(found.get("$a").map(String::as_str), Some("$a"));
+        assert_eq!(found.get("$c").map(String::as_str), Some("$c"));
+    }
+
+    #[test]
+    fn subexpression_interpolation_after_multibyte_char() {
+        // `é` is two bytes; the rebased span must stay byte-accurate (slicing on
+        // a non-char-boundary would panic).
+        let src = "Write-Output \"é $($x) y\"\n";
+        let out = parse(src);
+        let mut slice = None;
+        out.script.walk(&mut |n| {
+            if let NodeKind::Variable(name) = &n.kind {
+                if name == "$x" {
+                    slice = Some(n.span.slice(src).to_string());
+                }
+            }
+        });
+        assert_eq!(slice.as_deref(), Some("$x"));
+    }
+
+    #[test]
+    fn nested_subexpression_interpolation() {
+        // A sub-expression inside a sub-expression: the innermost variable is
+        // rebased once per level and ends up at an absolute offset.
+        let src = "Write-Output \"v $( $($y) ) w\"\n";
+        let out = parse(src);
+        let mut slice = None;
+        out.script.walk(&mut |n| {
+            if let NodeKind::Variable(name) = &n.kind {
+                if name == "$y" {
+                    slice = Some(n.span.slice(src).to_string());
+                }
+            }
+        });
+        assert_eq!(slice.as_deref(), Some("$y"));
+    }
+
+    #[test]
+    fn subexpression_interpolation_is_lossless() {
+        // The fix moves spans only; tokens and the round-trip are untouched.
+        let src = "Write-Output \"x $($file.Name) y\"\n";
+        let out = parse(src);
+        assert_eq!(crate::v2::reconstruct(&out.tokens), src);
+    }
+
+    #[test]
     fn parse_tokens_matches_parse_and_hands_tokens_back() {
         let src = "function Get-Thing { param([int]$n) $n + 1 }\nGet-Thing -n 2 | Write-Output\n";
 
@@ -2497,5 +2618,66 @@ mod tests {
                 .collect();
             let _ = parse(&src); // must not panic
         }
+    }
+
+    /// The first `Function` node in source order, with its captured name span.
+    fn first_function(src: &str) -> (String, Span, bool) {
+        let out = parse(src);
+        let mut found = None;
+        out.script.walk(&mut |n| {
+            if found.is_none() {
+                if let NodeKind::Function {
+                    name,
+                    name_span,
+                    filter,
+                    ..
+                } = &n.kind
+                {
+                    found = Some((name.clone(), *name_span, *filter));
+                }
+            }
+        });
+        found.expect("a function node")
+    }
+
+    #[test]
+    fn function_name_span_covers_the_name_only() {
+        let src = "function Get-Thing { param([int]$n) $n + 1 }\n";
+        let (name, span, filter) = first_function(src);
+        assert_eq!(name, "Get-Thing");
+        assert!(!filter);
+        // The span addresses just the name, not the whole `function ... { }`.
+        assert_eq!(span.slice(src), "Get-Thing");
+    }
+
+    #[test]
+    fn filter_name_span_covers_the_name_only() {
+        let src = "filter Skip-Blank { $_ }\n";
+        let (name, span, filter) = first_function(src);
+        assert_eq!(name, "Skip-Blank");
+        assert!(filter);
+        assert_eq!(span.slice(src), "Skip-Blank");
+    }
+
+    #[test]
+    fn missing_function_name_yields_empty_span() {
+        let src = "function { 1 }\n";
+        let out = parse(src);
+        assert!(!out.errors.is_empty());
+        let (name, span, _) = first_function(src);
+        assert!(name.is_empty());
+        // Empty, and positioned where the name would be (at the `{`).
+        assert_eq!(span.start, span.end);
+        assert_eq!(&src[span.start..], "{ 1 }\n");
+    }
+
+    #[test]
+    fn function_name_span_drives_a_rename() {
+        // Renaming a definition needs no token-stream lookup: edit name_span.
+        let src = "function Get-Thing { 1 }\n";
+        let (_, span, _) = first_function(src);
+        let edit = crate::v2::TextEdit::replace(span, "Get-Other".to_string());
+        let renamed = crate::v2::apply_edits(src, &[edit]).unwrap();
+        assert_eq!(renamed, "function Get-Other { 1 }\n");
     }
 }

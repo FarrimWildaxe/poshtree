@@ -173,6 +173,7 @@ pub mod tokens;
 #[cfg(feature = "v1")]
 pub mod tree;
 pub mod trivia;
+pub mod variables;
 
 pub use ast::{CSharpImport, CSharpMemberDef, CSharpParam, Node, NodeKind, StringKind};
 pub use edit::{apply_edits, EditError, TextEdit};
@@ -184,6 +185,10 @@ pub use tokens::{LexError, Token, TokenKind};
 #[cfg(feature = "v1")]
 pub use tree::{parse_with_tokens, Tree, TreeNode};
 pub use trivia::{Trivia, TriviaKind};
+pub use variables::{
+    is_automatic_variable, is_preference_variable, variable_name, variable_scope,
+    AUTOMATIC_VARIABLES, PREFERENCE_VARIABLES,
+};
 
 /// Concatenates `leading + value + trailing` over all tokens: the lossless
 /// unparse. Applied to the output of [`lex`], this reproduces the original

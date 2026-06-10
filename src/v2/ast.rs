@@ -201,6 +201,9 @@ pub enum NodeKind {
     Function {
         /// The function name.
         name: String,
+        /// Span of the name token alone, not the whole definition. Empty when
+        /// the name was missing.
+        name_span: Span,
         /// True for `filter`, false for `function`.
         filter: bool,
         /// The function body.
@@ -431,6 +434,196 @@ impl Node {
     pub fn for_each_child<'a>(&'a self, f: &mut impl FnMut(&'a Node)) {
         use NodeKind::*;
         match &self.kind {
+            Script(v) | ParamBlock(v) | Pipeline(v) | Array(v) | ArrayLiteral(v) => {
+                for n in v {
+                    f(n);
+                }
+            }
+            ClassDefinition { members, .. } | EnumDefinition { members, .. } => {
+                for n in members {
+                    f(n);
+                }
+            }
+            PipelineChain { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            Command {
+                name,
+                elements,
+                redirections,
+                csharp,
+                ..
+            } => {
+                f(name);
+                for n in elements {
+                    f(n);
+                }
+                if let Some(cs) = csharp {
+                    f(cs);
+                }
+                for n in redirections {
+                    f(n);
+                }
+            }
+            CSharpMemberDef(_) => {}
+            CommandParameter { argument, .. } => {
+                if let Some(a) = argument {
+                    f(a);
+                }
+            }
+            Redirection { target, .. } => {
+                if let Some(t) = target {
+                    f(t);
+                }
+            }
+            Assignment { target, value, .. } => {
+                f(target);
+                f(value);
+            }
+            If {
+                conditions,
+                blocks,
+                else_block,
+            } => {
+                for n in conditions {
+                    f(n);
+                }
+                for n in blocks {
+                    f(n);
+                }
+                if let Some(e) = else_block {
+                    f(e);
+                }
+            }
+            While { condition, body } => {
+                f(condition);
+                f(body);
+            }
+            DoWhile {
+                body, condition, ..
+            } => {
+                f(body);
+                f(condition);
+            }
+            For {
+                init,
+                condition,
+                update,
+                body,
+            } => {
+                if let Some(n) = init {
+                    f(n);
+                }
+                if let Some(n) = condition {
+                    f(n);
+                }
+                if let Some(n) = update {
+                    f(n);
+                }
+                f(body);
+            }
+            ForEach {
+                variable,
+                iterable,
+                body,
+            } => {
+                f(variable);
+                f(iterable);
+                f(body);
+            }
+            Switch { input, cases } => {
+                f(input);
+                for n in cases {
+                    f(n);
+                }
+            }
+            Function { body, .. } => f(body),
+            Try {
+                body,
+                catches,
+                finally_block,
+            } => {
+                f(body);
+                for n in catches {
+                    f(n);
+                }
+                if let Some(fin) = finally_block {
+                    f(fin);
+                }
+            }
+            Catch { body } => f(body),
+            ClassMember {
+                parameters,
+                default,
+                body,
+                ..
+            } => {
+                for n in parameters {
+                    f(n);
+                }
+                if let Some(d) = default {
+                    f(d);
+                }
+                if let Some(b) = body {
+                    f(b);
+                }
+            }
+            Flow { value, .. } => {
+                if let Some(v) = value {
+                    f(v);
+                }
+            }
+            Ternary {
+                condition,
+                if_true,
+                if_false,
+            } => {
+                f(condition);
+                f(if_true);
+                f(if_false);
+            }
+            Binary { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            Unary { operand, .. } | PostfixUnary { operand, .. } | Cast { operand, .. } => {
+                f(operand)
+            }
+            MemberAccess { target, .. } => f(target),
+            InvokeMember { target, args, .. } => {
+                f(target);
+                for n in args {
+                    f(n);
+                }
+            }
+            Index { target, index } => {
+                f(target);
+                f(index);
+            }
+            Paren(n) | SubExpression(n) | ScriptBlockExpression(n) => f(n),
+            Hashtable(pairs) => {
+                for (k, v) in pairs {
+                    f(k);
+                    f(v);
+                }
+            }
+            StringLiteral { parts, .. } => {
+                for n in parts {
+                    f(n);
+                }
+            }
+            Variable(_) | Number(_) | TypeExpression(_) | BareWord(_) | Using { .. } | Error(_) => {
+            }
+        }
+    }
+
+    /// Visits each direct child node by mutable reference, in source order.
+    /// The mutable mirror of [`Node::for_each_child`]; the two must stay in
+    /// step arm for arm.
+    pub fn for_each_child_mut(&mut self, f: &mut impl FnMut(&mut Node)) {
+        use NodeKind::*;
+        match &mut self.kind {
             Script(v) | ParamBlock(v) | Pipeline(v) | Array(v) | ArrayLiteral(v) => {
                 for n in v {
                     f(n);
