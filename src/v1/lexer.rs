@@ -487,7 +487,7 @@ impl Lexer {
         // Compute the lowercase form once: it both decides the classification
         // and, for a named operator, becomes the normalised `text`.
         let lower = word.to_lowercase();
-        if NAMED_OPERATORS.contains(&lower.as_str()) {
+        if crate::ops::is_named_operator_word(&lower, NAMED_OPERATORS) {
             let tok = self.add(TokenType::Operator, format!("-{word}"), line, col, pos);
             tok.text = Some(lower);
         } else {

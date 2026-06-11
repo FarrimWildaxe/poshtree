@@ -23,7 +23,7 @@
 
 use super::refactor::csharp_unit;
 use super::resolve::{resolve, DeclKind};
-use crate::v2::ast::{Node, NodeKind};
+use crate::v2::ast::{Node, NodeKind, StringKind};
 use crate::v2::edit::TextEdit;
 use crate::v2::span::Span;
 
@@ -84,38 +84,75 @@ fn ps_type_refs(scope: &Node, src: &str, from: &str, out: &mut Vec<Span>) {
         NodeKind::TypeExpression(_) if n.span.end > n.span.start + 1 => {
             let inner_start = n.span.start + 1;
             let inner_end = n.span.end - 1;
-            if let Some(s) = name_segment_span(&src[inner_start..inner_end], inner_start, from) {
-                out.push(s);
-            }
+            find_type_name_spans(&src[inner_start..inner_end], inner_start, from, out);
         }
         NodeKind::Cast { .. } => {
-            // The type literal at the start: `[ ... ]$operand`.
+            // The type literal at the start: `[ ... ]$operand`. Scan to the
+            // matching close bracket so a generic argument's inner `]` does not
+            // cut the type short (`[List[Logger]]`).
             let rest = &src[n.span.start..n.span.end];
-            if let Some(close) = rest.find(']') {
+            if let Some(close) = matching_bracket(rest) {
                 let inner_start = n.span.start + 1;
                 let inner_end = n.span.start + close;
                 if inner_end > inner_start {
-                    if let Some(s) =
-                        name_segment_span(&src[inner_start..inner_end], inner_start, from)
-                    {
-                        out.push(s);
-                    }
+                    find_type_name_spans(&src[inner_start..inner_end], inner_start, from, out);
                 }
             }
         }
         NodeKind::Command { name, elements, .. } => {
             if matches!(&name.kind, NodeKind::BareWord(w) if w.eq_ignore_ascii_case("new-object")) {
                 if let Some(node) = new_object_type_arg(elements) {
-                    if let NodeKind::BareWord(w) = &node.kind {
-                        if w.eq_ignore_ascii_case(from) {
-                            out.push(node.span);
+                    match &node.kind {
+                        NodeKind::BareWord(w) => {
+                            if w.eq_ignore_ascii_case(from) {
+                                out.push(node.span);
+                            }
                         }
+                        // A quoted type name: `New-Object 'Logger'` or
+                        // `New-Object -TypeName "My.Logger"`. Match inside the
+                        // quotes so they survive the rename. Interpolated
+                        // strings are skipped, since their value is not a
+                        // static name.
+                        NodeKind::StringLiteral { kind, parts, .. }
+                            if parts.is_empty()
+                                && matches!(kind, StringKind::Single | StringKind::Double)
+                                && node.span.end >= node.span.start + 2 =>
+                        {
+                            let inner_start = node.span.start + 1;
+                            let inner_end = node.span.end - 1;
+                            find_type_name_spans(
+                                &src[inner_start..inner_end],
+                                inner_start,
+                                from,
+                                out,
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }
         }
         _ => {}
     });
+}
+
+/// Byte offset of the `]` that matches the leading `[` in `s`, accounting for
+/// nested brackets (generic arguments). `s` must start with `[`.
+fn matching_bracket(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn ps_static_member_refs(
@@ -199,24 +236,36 @@ fn type_text_matches(inner: &str, target: &str) -> bool {
 /// Span of the part of a (possibly dotted) type text that names `from`: the
 /// whole trimmed text if it matches, else its last segment. `start` is the byte
 /// offset of `text` in the file.
-fn name_segment_span(text: &str, start: usize, from: &str) -> Option<Span> {
-    let lead = text.len() - text.trim_start().len();
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.eq_ignore_ascii_case(from) {
-        return Some(Span::new(start + lead, start + lead + trimmed.len()));
-    }
-    if trimmed.contains('.') {
-        if let Some(last) = trimmed.rsplit('.').next() {
-            if last.eq_ignore_ascii_case(from) {
-                let off = lead + (trimmed.len() - last.len());
-                return Some(Span::new(start + off, start + off + last.len()));
-            }
+/// Pushes a span for every whole-identifier occurrence of `from` inside a
+/// type-expression interior (case-insensitive). Identifier boundaries are
+/// respected, so `Logger` does not match inside `LoggerHelper`, and `.` is a
+/// namespace separator, so only the simple name (after the last `.`) of each
+/// dotted run is compared. This covers plain (`Logger`), array (`Logger[]`),
+/// dotted (`My.Logger`), and generic (`List[Logger]`, `Dictionary[Logger,
+/// Logger]`) type references; the latter contribute one span per occurrence.
+fn find_type_name_spans(text: &str, base: usize, from: &str, out: &mut Vec<Span>) {
+    let bytes = text.as_bytes();
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_word(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        // A maximal dotted run: ident ('.' ident)*.
+        let run_start = i;
+        while i < bytes.len() && (is_word(bytes[i]) || bytes[i] == b'.') {
+            i += 1;
+        }
+        let run = &text[run_start..i];
+        // The simple name is the part after the last '.'.
+        let dot = run.rfind('.').map_or(0, |d| d + 1);
+        let name = &run[dot..];
+        if name.eq_ignore_ascii_case(from) {
+            let s = run_start + dot;
+            out.push(Span::new(base + s, base + s + name.len()));
         }
     }
-    None
 }
 
 /// Scans from `offset` past separator/whitespace, then over an identifier; if
@@ -269,6 +318,53 @@ mod tests {
         assert!(result.contains("[NativeApi]$casted"));
         // No old type name remains.
         assert!(!result.contains("Win32"));
+    }
+
+    #[test]
+    fn rename_type_handles_array_generic_and_multiple_occurrences() {
+        // Array, generic-argument, and repeated type references on the
+        // PowerShell side all rename, while a longer name that merely contains
+        // the target as a prefix is left alone.
+        let src = "[Logger[]]::new()\n\
+                   [System.Collections.Generic.List[Logger]]$x = $null\n\
+                   [System.Collections.Generic.Dictionary[Logger,Logger]]::new()\n\
+                   [LoggerHelper]::Init()\n\
+                   [My.Logger]::X()\n";
+        let out = parse(src);
+        let edits = rename_type(&out.script, src, "Logger", "Tracer");
+        let result = apply_edits(src, &edits).unwrap();
+        assert!(result.contains("[Tracer[]]::new()"));
+        assert!(result.contains("List[Tracer]"));
+        assert!(result.contains("Dictionary[Tracer,Tracer]"));
+        assert!(result.contains("[My.Tracer]::X()"));
+        // The prefix-only name keeps its full spelling.
+        assert!(result.contains("[LoggerHelper]::Init()"));
+        // No standalone old type name survives (LoggerHelper still present).
+        assert!(!result.contains("[Logger]"));
+        assert!(!result.contains("[Logger["));
+    }
+
+    #[test]
+    fn rename_type_handles_quoted_new_object_names() {
+        // Quoted spellings are common (`New-Object -TypeName 'X'`). The match
+        // happens inside the quotes, dotted names rename their simple segment,
+        // and interpolated or prefix-only strings are left alone.
+        let src = "New-Object -TypeName 'Logger'\n\
+                   New-Object \"Logger\"\n\
+                   New-Object 'My.Logger'\n\
+                   New-Object \"$prefix.Logger\"\n\
+                   New-Object 'LoggerHelper'\n";
+        let out = parse(src);
+        let edits = rename_type(&out.script, src, "Logger", "Tracer");
+        let result = apply_edits(src, &edits).unwrap();
+        assert!(result.contains("-TypeName 'Tracer'"));
+        assert!(result.contains("New-Object \"Tracer\""));
+        assert!(result.contains("'My.Tracer'"));
+        assert!(
+            result.contains("\"$prefix.Logger\""),
+            "interpolated untouched"
+        );
+        assert!(result.contains("'LoggerHelper'"), "prefix-only untouched");
     }
 
     #[test]

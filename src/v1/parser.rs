@@ -339,10 +339,20 @@ pub struct Parser {
     src: String,
     i: usize,
     pub errors: Vec<String>,
+    /// Recursion depth across statements and expressions; bounded by
+    /// `MAX_DEPTH` so pathological nesting cannot exhaust the stack.
+    depth: usize,
+    /// Latched once `MAX_DEPTH` is crossed. While set, the recursive entry
+    /// points stop descending and the input drains linearly.
+    overflowed: bool,
     /// `$plainvar` → assigned string-literal value, for resolving inline C#
     /// passed to `Add-Type` by variable (simple constant propagation).
     vars: HashMap<String, String>,
 }
+
+/// Guards against pathological nesting blowing the stack on adversarial
+/// input. Same limit as the v2 parser.
+const MAX_DEPTH: usize = 100;
 
 struct ParseError {
     msg: String,
@@ -351,6 +361,34 @@ struct ParseError {
 }
 
 impl Parser {
+    fn enter(&mut self) -> bool {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.overflowed = true;
+        }
+        self.overflowed
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    /// The error for crossing the depth limit. Consumes one token so the
+    /// enclosing recovery loop drains the remaining input linearly instead of
+    /// re-parsing the same tokens.
+    fn too_deep(&mut self, what: &str) -> ParseError {
+        let tok = self.cur();
+        let (line, col) = (tok.line, tok.col);
+        if !self.eof() {
+            self.next();
+        }
+        ParseError {
+            msg: format!("{what} nested too deeply"),
+            line,
+            col,
+        }
+    }
+
     pub fn new(tokens: Vec<Token>, source: String) -> Self {
         // drop comments, keep newlines
         let toks = tokens.into_iter().filter(|t| t.ty != T::Comment).collect();
@@ -359,6 +397,8 @@ impl Parser {
             src: source,
             i: 0,
             errors: Vec::new(),
+            depth: 0,
+            overflowed: false,
             vars: HashMap::new(),
         }
     }
@@ -464,6 +504,16 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<Option<AstNode>, ParseError> {
+        if self.enter() {
+            self.leave();
+            return Err(self.too_deep("statement"));
+        }
+        let r = self.parse_statement_inner();
+        self.leave();
+        r
+    }
+
+    fn parse_statement_inner(&mut self) -> Result<Option<AstNode>, ParseError> {
         self.skip_inline_newlines();
         let tok = self.cur();
 
@@ -2003,6 +2053,16 @@ impl Parser {
     // Primary
 
     fn parse_primary(&mut self) -> Result<AstNode, ParseError> {
+        if self.enter() {
+            self.leave();
+            return Err(self.too_deep("expression"));
+        }
+        let r = self.parse_primary_inner();
+        self.leave();
+        r
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<AstNode, ParseError> {
         let tok = self.cur().clone();
         match tok.ty {
             T::Variable => {
@@ -2560,5 +2620,52 @@ public static extern IntPtr CreateThread(IntPtr a);
             crate::unparse_source("class C { [ValidateNotNull()] [string]$X }")
                 .contains("ValidateNotNull()")
         );
+    }
+
+    #[test]
+    fn deeply_nested_input_is_bounded() {
+        // Pre-guard, nested parens aborted the process at depth ~1000 and the
+        // interleaved shape at ~500. With the depth guard each returns with a
+        // depth error well before the stack is exhausted, so this runs on the
+        // ordinary test stack without overflowing.
+        // A debug recursive-descent frame here is large, so reaching the
+        // depth limit needs more than the default test-thread stack; run on a
+        // generous one. The point is that the guard returns rather than the
+        // process aborting.
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(|| {
+                for src in [
+                    format!("{}1{}", "(".repeat(5000), ")".repeat(5000)),
+                    format!("{}1{}", "if (1) {{ (".repeat(5000), ") }}".repeat(5000)),
+                    format!("{}1{}", "if (1) {{".repeat(5000), "}}".repeat(5000)),
+                ] {
+                    let (_, errors) = parse(&src);
+                    assert!(
+                        errors.iter().any(|m| m.contains("deeply")),
+                        "expected a depth-limit error"
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .expect("v1 parser must not overflow the stack");
+    }
+
+    #[test]
+    fn moderate_nesting_still_parses_without_a_depth_error() {
+        // Run on a default-sized (8 MiB) stack; the default 2 MiB test thread
+        // is too small for this many large debug frames, which is a property of
+        // the legacy recursive descent, not of the guard.
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                let src = format!("{}1{}", "if (1) {{".repeat(30), "}}".repeat(30));
+                let (_, errors) = parse(&src);
+                assert!(!errors.iter().any(|m| m.contains("deeply")));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

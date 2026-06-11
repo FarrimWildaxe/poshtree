@@ -96,13 +96,16 @@ struct RefSite {
     scope: usize,
 }
 
-/// A member-access reference: the accessed name, its span, and the receiver it
-/// was reached through (when that receiver is a bare name).
+/// A member-access reference: the accessed name, its span, the receiver it
+/// was reached through (when that receiver is a bare name), and the type whose
+/// body the reference sits in (needed so `this.X` binds to the enclosing
+/// type's `X`, not to a same-named member of another type).
 #[derive(Debug, Clone)]
 struct MemberRef {
     text: String,
     span: Span,
     receiver: Option<String>,
+    enclosing_type: Option<String>,
 }
 
 /// The result of resolving a [`CsUnit`]: its declarations and the references
@@ -173,7 +176,7 @@ impl Resolved {
                 .get(decl.scope)
                 .and_then(|t| t.as_deref());
             for m in &self.member_refs {
-                if m.text == decl.name && self.receiver_is_this_member(&m.receiver, owner) {
+                if m.text == decl.name && self.receiver_is_this_member(m, owner) {
                     spans.push(m.span);
                 }
             }
@@ -184,11 +187,17 @@ impl Resolved {
     }
 
     /// Whether a member-access receiver can only denote the current member's
-    /// owner: the implicit instance (`this`/`base`) or the declaring type by
-    /// name (static access). An unknown receiver (`None`) never qualifies.
-    fn receiver_is_this_member(&self, receiver: &Option<String>, owner: Option<&str>) -> bool {
-        match receiver.as_deref() {
-            Some("this") | Some("base") => true,
+    /// owner. `this` qualifies only when the reference sits inside the owner
+    /// type's own body, so a same-named member of another type does not capture
+    /// it. `base` never binds: it names a member of a parent type, and this
+    /// single-file model has no inheritance information, so guessing would
+    /// attach the reference to the wrong declaration. A bare-name receiver
+    /// qualifies when it is the declaring type's name (static access), from
+    /// anywhere. An unknown receiver (`None`) never qualifies.
+    fn receiver_is_this_member(&self, m: &MemberRef, owner: Option<&str>) -> bool {
+        match m.receiver.as_deref() {
+            Some("this") => owner.is_some() && m.enclosing_type.as_deref() == owner,
+            Some("base") => false,
             Some(r) => owner == Some(r),
             None => false,
         }
@@ -336,6 +345,7 @@ impl Builder {
                     text: r.text.clone(),
                     span: r.span,
                     receiver: r.receiver.clone(),
+                    enclosing_type: self.type_of_scope[r.scope].clone(),
                 });
             } else if let Some(id) = self.lookup(r.scope, &r.text) {
                 root_refs[id].push(r.span);
@@ -409,6 +419,34 @@ mod tests {
         let refs = ref_texts(src, "a", DeclKind::Param);
         // declaration + two uses of `a`
         assert_eq!(refs.len(), 3);
+    }
+
+    #[test]
+    fn this_references_do_not_leak_across_types() {
+        // Both classes declare `Count` and use `this.Count`. Each field's
+        // references must stay inside its own type: renaming A.Count must not
+        // touch B's `this.Count`, and the other way round.
+        let src = "class A { public int Count; void M() { this.Count = 1; } }\n\
+                   class B { public int Count; void N() { this.Count = 2; } }";
+        let r = resolve_src(src);
+        for id in r.find("Count", Some(DeclKind::Field)) {
+            let owner = r.enclosing_type(id).expect("field has a type").to_string();
+            let refs = r.references_of(id);
+            assert_eq!(refs.len(), 2, "decl + own this.Count for {owner}: {refs:?}");
+            // Every span sits inside its own class's source half.
+            let own_half = if owner == "A" { 0..59 } else { 59..src.len() };
+            for s in &refs {
+                assert!(
+                    own_half.contains(&s.start),
+                    "{owner}.Count ref at {s:?} leaked outside its class"
+                );
+            }
+        }
+        // Static access through the type name still binds from another type.
+        let src2 = "class A { public static int Count; }\nclass B { void N() { A.Count = 5; } }";
+        let r2 = resolve_src(src2);
+        let id = *r2.find("Count", Some(DeclKind::Field)).first().unwrap();
+        assert_eq!(r2.references_of(id).len(), 2, "decl + A.Count static use");
     }
 
     #[test]

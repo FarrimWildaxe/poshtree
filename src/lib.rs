@@ -35,6 +35,7 @@
 //! ```
 
 pub mod encoding;
+mod ops;
 pub mod textutil;
 #[cfg(feature = "v1")]
 pub mod unparse;

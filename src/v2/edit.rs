@@ -74,7 +74,11 @@ impl std::error::Error for EditError {}
 /// all rejected. Touching spans (`a.end == b.start`) are fine.
 pub fn apply_edits(src: &str, edits: &[TextEdit]) -> Result<String, EditError> {
     let mut order: Vec<usize> = (0..edits.len()).collect();
-    order.sort_by_key(|&i| edits[i].span.start);
+    // Sort by start, then by end. The secondary key matters when a zero-width
+    // insertion shares a start offset with a replacement: the insertion (end ==
+    // start) must sort first so the adjacency check below sees it as touching
+    // the replacement's left edge rather than as overlapping it.
+    order.sort_by_key(|&i| (edits[i].span.start, edits[i].span.end));
 
     for &i in &order {
         let span = edits[i].span;
@@ -169,6 +173,35 @@ mod tests {
         assert!(matches!(
             apply_edits("ż", &[TextEdit::insert(1, "x")]),
             Err(EditError::NotCharBoundary(1))
+        ));
+    }
+
+    #[test]
+    fn insertion_at_a_replacement_boundary_is_order_independent() {
+        // A zero-width insertion at the start (or end) of a replacement is a
+        // boundary insertion, not an overlap, and the result must not depend on
+        // the order the edits were supplied in.
+        let src = "0123456789";
+        let want = "PREX";
+        let insert_first = [
+            TextEdit::insert(0, "PRE"),
+            TextEdit::replace(Span::new(0, 10), "X"),
+        ];
+        let replace_first = [
+            TextEdit::replace(Span::new(0, 10), "X"),
+            TextEdit::insert(0, "PRE"),
+        ];
+        assert_eq!(apply_edits(src, &insert_first).unwrap(), want);
+        assert_eq!(apply_edits(src, &replace_first).unwrap(), want);
+
+        // An insertion strictly inside a replacement is still an overlap.
+        let inside = [
+            TextEdit::replace(Span::new(0, 10), "X"),
+            TextEdit::insert(5, "Y"),
+        ];
+        assert!(matches!(
+            apply_edits(src, &inside),
+            Err(EditError::Overlap { .. })
         ));
     }
 

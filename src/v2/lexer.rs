@@ -53,7 +53,7 @@ fn is_keyword(word: &str) -> bool {
 }
 
 fn is_named_operator(word: &str) -> bool {
-    NAMED_OPERATORS.contains(&word.to_lowercase().as_str())
+    crate::ops::is_named_operator_word(word, NAMED_OPERATORS)
 }
 
 /// Non-newline blank characters that become [`TriviaKind::Whitespace`]. The
@@ -721,11 +721,18 @@ impl<'a> Lexer<'a> {
             return self.finish_redirect();
         }
 
-        self.scan_number_core();
+        let start = self.pos;
+        let radix_without_digits = self.scan_number_core();
         self.scan_number_suffix();
         if matches!(self.peek(), Some(c) if c.is_alphabetic() || c == '_') {
             self.scan_word();
             return TokenKind::Generic;
+        }
+        if radix_without_digits {
+            // `0x` / `0b` with nothing after the prefix. The token stays a
+            // Number so the input still round-trips; the error records that no
+            // PowerShell engine would accept the literal.
+            self.error(Span::new(start, self.pos), "radix prefix with no digits");
         }
         TokenKind::Number
     }
@@ -745,23 +752,27 @@ impl<'a> Lexer<'a> {
         TokenKind::Redirect
     }
 
-    fn scan_number_core(&mut self) {
+    /// Returns true when a `0x`/`0b` radix prefix was consumed with no digits
+    /// after it; the caller reports it if the token stays a Number.
+    fn scan_number_core(&mut self) -> bool {
         let rest = self.rest();
         if rest.len() >= 2 && (rest.starts_with("0x") || rest.starts_with("0X")) {
             self.bump();
             self.bump();
+            let digits_start = self.pos;
             while matches!(self.peek(), Some(c) if c.is_ascii_hexdigit()) {
                 self.bump();
             }
-            return;
+            return self.pos == digits_start;
         }
         if rest.len() >= 2 && (rest.starts_with("0b") || rest.starts_with("0B")) {
             self.bump();
             self.bump();
+            let digits_start = self.pos;
             while matches!(self.peek(), Some('0' | '1')) {
                 self.bump();
             }
-            return;
+            return self.pos == digits_start;
         }
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             self.bump();
@@ -773,6 +784,7 @@ impl<'a> Lexer<'a> {
             }
         }
         self.scan_exponent();
+        false
     }
 
     /// `e3`, `E+5`, `e-2`; consumed only when at least one digit follows.
@@ -988,6 +1000,41 @@ mod tests {
         // `$i--` and subtraction
         assert_eq!(kinds("$i--"), vec![Variable, Operator, Eof]);
         assert_eq!(kinds("3 - 1"), vec![Number, Operator, Number, Eof]);
+    }
+
+    #[test]
+    fn case_prefixed_operator_spellings_are_operators() {
+        // Every prefixable comparison name in plain, `c`, and `i` spellings.
+        // Derived, not sampled, so a new entry in the set is covered too.
+        for base in crate::ops::CASE_PREFIXABLE {
+            for prefix in ["", "c", "i", "C", "I"] {
+                let src = format!("1 -{prefix}{base} 2");
+                let out = lex(&src);
+                assert_eq!(
+                    out.tokens[1].kind, Operator,
+                    "-{prefix}{base} should lex as an operator"
+                );
+            }
+        }
+        // The prefix does not apply outside the comparison set.
+        for op in ["-cand", "-cor", "-cjoin", "-cis", "-cisnot", "-cshl"] {
+            let out = lex(&format!("1 {op} 2"));
+            assert_eq!(out.tokens[1].kind, Parameter, "{op} is not an operator");
+        }
+    }
+
+    #[test]
+    fn radix_prefix_without_digits_is_reported() {
+        for src in ["0x", "0b", "$a = 0x"] {
+            let out = lex(src);
+            assert_eq!(out.errors.len(), 1, "{src}: {:?}", out.errors);
+            assert!(out.errors[0].message.contains("radix"));
+            // Lossless: the token text is preserved.
+            assert_eq!(crate::v2::reconstruct(&out.tokens), src);
+        }
+        for src in ["0x1F", "0b1010", "0xFFL", "0x10kb", "0xZZ", "0"] {
+            assert!(lex(src).errors.is_empty(), "{src} should not error");
+        }
     }
 
     #[test]

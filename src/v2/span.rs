@@ -66,6 +66,10 @@ impl fmt::Display for Span {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineCol {
     pub line: u32,
+    /// Column as a byte offset within the line, not a character count. On a
+    /// line containing multi-byte characters this differs from the column an
+    /// editor displays (chars) and from the UTF-16 unit count an LSP client
+    /// expects; convert via the line's text when either of those is needed.
     pub col: u32,
 }
 

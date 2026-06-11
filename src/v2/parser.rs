@@ -95,6 +95,8 @@ pub fn parse_tokens(src: &str, tokens: Vec<Token>) -> ParseOutput {
         pos: 0,
         errors: Vec::new(),
         depth: 0,
+        in_command_argument: false,
+        overflowed: false,
         vars: std::collections::HashMap::new(),
     };
     let body = parser.parse_block_body(&[]);
@@ -123,15 +125,24 @@ struct Parser<'a> {
     pos: usize,
     errors: Vec<ParseError>,
     depth: u32,
-    /// `$plainvar = "literal"` assignments, for recovering inline C# handed to
-    /// `Add-Type` through a variable.
+    /// True while parsing a top-level command-argument expression. The glued
+    /// `*` reinterpretation is suppressed here, because in argument position
+    /// `$x*2` is a glob continuation, not multiplication. Grouping constructs
+    /// (parens, script blocks, statements) clear it, since they re-enter pure
+    /// expression context.
+    in_command_argument: bool,
+    /// Set once the depth limit is hit. While set, the recursive entry points
+    /// stop descending and drain one token at a time, so recovery from
+    /// pathological nesting stays linear in the token count instead of letting
+    /// a parent re-drive the parse of the levels beneath it.
+    overflowed: bool,
     /// `$plainvar = "literal"` assignments, for recovering inline C# handed to
     /// `Add-Type` through a variable. Stores the body and its source span.
     vars: std::collections::HashMap<String, (String, Span)>,
 }
 
 /// Guards against pathological nesting blowing the stack on adversarial input.
-const MAX_DEPTH: u32 = 400;
+const MAX_DEPTH: u32 = 200;
 
 impl Parser<'_> {
     // Cursor
@@ -263,7 +274,14 @@ impl Parser<'_> {
     }
 
     fn is_command_start(&self) -> bool {
-        matches!(self.kind(), T::Generic | T::Amp | T::Dot | T::Keyword)
+        if matches!(self.kind(), T::Generic | T::Amp | T::Dot | T::Keyword) {
+            return true;
+        }
+        // `%` and `?` are the ForEach-Object / Where-Object aliases. The lexer
+        // always emits them as operators (it is context-free by design), but in
+        // command position they name a command. Expression uses (modulo,
+        // ternary) are unaffected: those sites never ask is_command_start.
+        self.at(T::Operator) && matches!(self.value(), "%" | "?")
     }
 
     /// Tokens that can begin a command argument, mirroring v1's set. Used to
@@ -301,7 +319,10 @@ impl Parser<'_> {
 
     fn enter(&mut self) -> bool {
         self.depth += 1;
-        self.depth > MAX_DEPTH
+        if self.depth > MAX_DEPTH {
+            self.overflowed = true;
+        }
+        self.overflowed
     }
 
     fn leave(&mut self) {
@@ -349,6 +370,29 @@ impl Parser<'_> {
     }
 
     fn parse_statement(&mut self) -> Node {
+        if self.enter() {
+            self.leave();
+            // Past the depth limit, consume one token and return an error node
+            // spanning it. Consuming keeps the enclosing block loop making
+            // progress without its no-progress path logging a second error per
+            // token, so a pathological input drains linearly instead of
+            // emitting several errors per level.
+            let start = self.pos;
+            self.error("statement nested too deeply");
+            if !self.at_end() {
+                self.bump();
+            }
+            return self.make(NodeKind::Error("too deep".into()), start, self.pos);
+        }
+        let saved = self.in_command_argument;
+        self.in_command_argument = false;
+        let node = self.parse_statement_inner();
+        self.in_command_argument = saved;
+        self.leave();
+        node
+    }
+
+    fn parse_statement_inner(&mut self) -> Node {
         if self.at(T::Keyword) {
             match self.lower().as_str() {
                 "if" => return self.parse_if(),
@@ -590,7 +634,11 @@ impl Parser<'_> {
 
     fn parse_command_argument(&mut self) -> Node {
         if self.arg_is_expression() {
-            self.parse_expression()
+            let saved = self.in_command_argument;
+            self.in_command_argument = true;
+            let node = self.parse_expression();
+            self.in_command_argument = saved;
+            node
         } else {
             let v = self.value().to_string();
             self.leaf(NodeKind::BareWord(v))
@@ -1292,42 +1340,135 @@ impl Parser<'_> {
     fn parse_binary(&mut self, min_prec: u8) -> Node {
         let start = self.pos;
         let mut left = self.parse_unary();
-        while let Some(prec) = self.binary_prec() {
-            if prec < min_prec {
+        loop {
+            if let Some(prec) = self.binary_prec() {
+                if prec < min_prec {
+                    break;
+                }
+                let op = self.value().to_string();
+                self.bump();
+                let right = self.parse_binary(prec + 1);
+                left = self.make(
+                    NodeKind::Binary {
+                        op,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                    start,
+                    self.pos,
+                );
+                continue;
+            }
+            // `$_*2` glues into one Generic token because the lexer reads `*`
+            // followed by a word as a wildcard (argument mode). Here an
+            // operand just ended, so the expression-mode reading applies:
+            // split the token into `*`-separated numeric segments and fold
+            // them left-associatively, leaving the token stream untouched.
+            const STAR_PREC: u8 = 7; // same tier as `*` `/` `%`
+            if STAR_PREC < min_prec {
                 break;
             }
-            let op = self.value().to_string();
-            self.bump();
-            let right = self.parse_binary(prec + 1);
-            left = self.make(
-                NodeKind::Binary {
-                    op,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                },
-                start,
-                self.pos,
-            );
+            let Some(segments) = self.glued_star_segments() else {
+                break;
+            };
+            let range_end = self.bump() + 1;
+            for (mut seg, delta) in segments {
+                let range = TokenRange {
+                    first: left.range.first,
+                    end: range_end,
+                };
+                rebase(
+                    &mut seg,
+                    delta,
+                    TokenRange {
+                        first: range_end - 1,
+                        end: range_end,
+                    },
+                );
+                let span = Span::new(left.span.start, seg.span.end);
+                left = Node {
+                    kind: NodeKind::Binary {
+                        op: "*".to_string(),
+                        left: Box::new(left),
+                        right: Box::new(seg),
+                    },
+                    span,
+                    range,
+                };
+            }
         }
         left
+    }
+
+    /// When the current token is a Generic of the shape `*<n>` or
+    /// `*<n>*<m>...` whose every `*`-separated segment is a numeric literal,
+    /// returns the parsed segments paired with their absolute byte offsets,
+    /// consuming nothing. Anything else (`*abc`, `*.log`, empty segments from
+    /// `**`) returns `None`, so glob arguments keep the wildcard reading, and
+    /// the whole path is suppressed in command-argument position, where `$x*2`
+    /// is a glob continuation.
+    fn glued_star_segments(&self) -> Option<Vec<(Node, usize)>> {
+        if self.in_command_argument || !self.at(T::Generic) {
+            return None;
+        }
+        let tok = &self.tokens[self.pos];
+        let rest = tok.value.strip_prefix('*')?;
+        if rest.is_empty() {
+            return None; // a lone `*` is already an Operator
+        }
+        let mut segments = Vec::new();
+        let mut offset = tok.span.start + 1; // past the leading `*`
+        for seg in rest.split('*') {
+            if seg.is_empty() {
+                return None; // `**` stays a glob
+            }
+            let sub = parse(seg);
+            if !sub.errors.is_empty() {
+                return None;
+            }
+            let node = unwrap_single_expression(sub.script)?;
+            let is_numeric = match &node.kind {
+                NodeKind::Number(_) => true,
+                // `-` is a word character (command names), so `*-2` glues too;
+                // a sign-wrapped numeric literal is still multiplication.
+                NodeKind::Unary { op, operand } => {
+                    matches!(op.as_str(), "-" | "+") && matches!(operand.kind, NodeKind::Number(_))
+                }
+                _ => false,
+            };
+            if !is_numeric {
+                return None; // `*abc` is a glob word, not multiplication
+            }
+            segments.push((node, offset));
+            offset += seg.len() + 1; // past this segment and the next `*`
+        }
+        Some(segments)
     }
 
     fn binary_prec(&self) -> Option<u8> {
         if !self.at(T::Operator) {
             return None;
         }
-        let v = self.lower();
-        Some(match v.as_str() {
-            "??" => 1,
-            "-or" | "-xor" => 2,
-            "-and" => 3,
-            "-band" | "-bor" | "-bxor" => 3,
-            ".." => 8,
-            "+" | "-" => 6,
-            "*" | "/" | "%" => 7,
-            _ if is_comparison_op(&v) => 5,
-            _ => return None,
-        })
+        let tok = &self.tokens[self.pos];
+        let eq = |s: &str| tok.value_eq_ci(s);
+        let v = tok.value.as_str();
+        if eq("??") {
+            Some(1)
+        } else if eq("-or") || eq("-xor") {
+            Some(2)
+        } else if eq("-and") {
+            Some(3)
+        } else if eq("..") {
+            Some(8)
+        } else if eq("+") || eq("-") {
+            Some(6)
+        } else if eq("*") || eq("/") || eq("%") {
+            Some(7)
+        } else if is_comparison_op(v) || is_bitwise_op(v) {
+            Some(5)
+        } else {
+            None
+        }
     }
 
     fn parse_unary(&mut self) -> Node {
@@ -1339,8 +1480,11 @@ impl Parser<'_> {
             return self.make(NodeKind::ArrayLiteral(vec![operand]), start, self.pos);
         }
         if self.at(T::Operator) {
-            let v = self.lower();
-            if matches!(v.as_str(), "-" | "+" | "!" | "-not" | "-bnot" | "++" | "--") {
+            let tok = &self.tokens[self.pos];
+            let is_unary_op = ["-", "+", "!", "-not", "-bnot", "++", "--"]
+                .iter()
+                .any(|s| tok.value_eq_ci(s));
+            if is_unary_op {
                 let op = self.value().to_string();
                 self.bump();
                 let operand = self.parse_unary();
@@ -1426,7 +1570,7 @@ impl Parser<'_> {
                 }
             } else if self.at(T::LBracket) || null_index {
                 self.bump();
-                let index = self.parse_expression();
+                let index = self.in_expression_context(|p| p.parse_expression());
                 self.expect(T::RBracket, "']'");
                 node = self.make(
                     NodeKind::Index {
@@ -1460,18 +1604,37 @@ impl Parser<'_> {
         if !self.at(T::RParen) && !self.at_end() {
             // v1 parses the whole argument list as one expression, so a comma
             // list becomes a single ArrayLiteral argument.
-            args.push(self.parse_expression());
+            let arg = self.in_expression_context(|p| p.parse_expression());
+            args.push(arg);
         }
         self.expect(T::RParen, "')'");
         args
     }
 
+    /// Runs `f` with the command-argument flag cleared: grouping constructs
+    /// re-enter pure expression context, where glued `*` is multiplication
+    /// again (`dir ($_*2)`).
+    fn in_expression_context<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.in_command_argument;
+        self.in_command_argument = false;
+        let r = f(self);
+        self.in_command_argument = saved;
+        r
+    }
+
     fn parse_primary(&mut self) -> Node {
         if self.enter() {
             self.leave();
-            let i = self.pos;
+            // Past the depth limit (sticky once hit): consume one token and
+            // return an error node. Consuming guarantees the cursor advances, so
+            // an enclosing loop or a parent retry drains the remaining input
+            // linearly instead of re-parsing the same tokens.
+            let start = self.pos;
             self.error("expression nested too deeply");
-            return self.make(NodeKind::Error("too deep".into()), i, i);
+            if !self.at_end() {
+                self.bump();
+            }
+            return self.make(NodeKind::Error("too deep".into()), start, self.pos);
         }
         let node = self.parse_primary_inner();
         self.leave();
@@ -1495,7 +1658,7 @@ impl Parser<'_> {
             T::HereStringDq => self.string_leaf(StringKind::HereDouble),
             T::LParen => {
                 self.bump();
-                let inner = self.parse_pipeline_statement();
+                let inner = self.in_expression_context(|p| p.parse_pipeline_statement());
                 self.expect(T::RParen, "')'");
                 self.make(NodeKind::Paren(Box::new(inner)), start, self.pos)
             }
@@ -1512,7 +1675,7 @@ impl Parser<'_> {
                 self.expect(T::RParen, "')'");
                 self.make(NodeKind::Array(items), start, self.pos)
             }
-            T::AtBrace => self.parse_hashtable(),
+            T::AtBrace => self.in_expression_context(|p| p.parse_hashtable()),
             T::LBrace => {
                 self.bump();
                 let body = self.parse_block_body(&[T::RBrace]);
@@ -1618,38 +1781,56 @@ fn is_assignment_op(op: &str) -> bool {
 }
 
 fn is_comparison_op(v: &str) -> bool {
+    // Operators are case-insensitive in PowerShell (`-EQ`, `-iLike`). Strip a
+    // leading `-`, then match the name. The optional case-sensitivity prefix
+    // (`c`/`i`, as in `-ceq` / `-ieq`) is only stripped when the full name does
+    // not already match, so operators that begin with `c` or `i` (`-contains`,
+    // `-in`, `-is`, `-isnot`) are still recognized.
     let core = v.strip_prefix('-').unwrap_or(v);
-    // PowerShell spells case-sensitive and case-insensitive comparison as a
-    // `c`/`i` prefix on the operator name (`-ceq`, `-ilike`); stripping the
-    // prefix lets one list cover all three spellings of each operator.
-    let core = core
-        .strip_prefix('c')
-        .or_else(|| core.strip_prefix('i'))
-        .unwrap_or(core);
-    matches!(
-        core,
-        "eq" | "ne"
-            | "gt"
-            | "ge"
-            | "lt"
-            | "le"
-            | "like"
-            | "notlike"
-            | "match"
-            | "notmatch"
-            | "contains"
-            | "notcontains"
-            | "in"
-            | "notin"
-            | "is"
-            | "isnot"
-            | "replace"
-            | "split"
-            | "join"
-            | "f"
-            | "shl"
-            | "shr"
-    )
+    const NAMES: &[&str] = &[
+        "eq",
+        "ne",
+        "gt",
+        "ge",
+        "lt",
+        "le",
+        "like",
+        "notlike",
+        "match",
+        "notmatch",
+        "contains",
+        "notcontains",
+        "in",
+        "notin",
+        "is",
+        "isnot",
+        "replace",
+        "split",
+        "join",
+        "f",
+        "shl",
+        "shr",
+    ];
+    let matches_name = |s: &str| NAMES.iter().any(|n| n.eq_ignore_ascii_case(s));
+    if matches_name(core) {
+        return true;
+    }
+    match core.as_bytes().first() {
+        Some(b'c' | b'C' | b'i' | b'I') => crate::ops::CASE_PREFIXABLE
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&core[1..])),
+        _ => false,
+    }
+}
+
+/// The binary bitwise operators. In PowerShell these share one precedence tier
+/// with the comparison operators (`-shl` and `-shr` are already covered by
+/// [`is_comparison_op`]), evaluated left to right.
+fn is_bitwise_op(v: &str) -> bool {
+    let core = v.strip_prefix('-').unwrap_or(v);
+    ["band", "bor", "bxor"]
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(core))
 }
 
 fn strip_sigil(var: &str) -> String {
@@ -1822,6 +2003,22 @@ fn extract_interpolations(inner: &str, base: usize, idx: usize) -> Vec<Node> {
 /// (offsets relative to that substring) into the coordinates of the original
 /// source. The token range is set to the string token's placeholder, since the
 /// sub-expression's tokens are not part of the outer token stream.
+/// Peels single-statement `Script`/`Pipeline` wrappers off a re-parsed
+/// fragment, yielding the one expression inside, or `None` when the fragment
+/// is not exactly one expression.
+fn unwrap_single_expression(node: Node) -> Option<Node> {
+    match node.kind {
+        NodeKind::Script(mut v) | NodeKind::Pipeline(mut v) => {
+            if v.len() == 1 {
+                unwrap_single_expression(v.pop().expect("length checked"))
+            } else {
+                None
+            }
+        }
+        _ => Some(node),
+    }
+}
+
 fn rebase(node: &mut Node, delta: usize, range: TokenRange) {
     node.span = Span::new(node.span.start + delta, node.span.end + delta);
     node.range = range;
@@ -2679,5 +2876,295 @@ mod tests {
         let edit = crate::v2::TextEdit::replace(span, "Get-Other".to_string());
         let renamed = crate::v2::apply_edits(src, &[edit]).unwrap();
         assert_eq!(renamed, "function Get-Other { 1 }\n");
+    }
+
+    #[test]
+    fn deeply_nested_statements_are_bounded() {
+        // Statement recursion (nested `if { ... }`) is depth-guarded, so a
+        // pathological nesting returns with a recorded error instead of
+        // recursing until the stack is exhausted. Without the guard this input
+        // overflows and aborts the process. Run on an explicit default-sized
+        // (8 MiB) stack so the test is independent of the harness default.
+        let handle = std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                let depth = 100_000;
+                let src = format!("{}1{}", "if (1) {".repeat(depth), "}".repeat(depth));
+                let out = parse(&src);
+                out.errors
+                    .iter()
+                    .any(|e| format!("{e:?}").contains("deeply"))
+            })
+            .unwrap();
+        let hit_guard = handle.join().expect("parser must not overflow the stack");
+        assert!(hit_guard, "expected a depth-limit error");
+    }
+
+    #[test]
+    fn moderate_statement_nesting_still_parses() {
+        // The limit is well above realistic block nesting, so ordinary scripts
+        // are unaffected.
+        let depth = 50;
+        let src = format!("{}1{}", "if (1) {".repeat(depth), "}".repeat(depth));
+        let out = parse(&src);
+        assert!(
+            !out.errors
+                .iter()
+                .any(|e| format!("{e:?}").contains("deeply")),
+            "depth {depth} should be under the limit"
+        );
+    }
+
+    #[test]
+    fn interleaved_nesting_recovers_linearly() {
+        // Interleaving statement and expression nesting (`if (1) { (` ...) used
+        // to blow up: once the depth guard tripped, a non-consuming error let a
+        // parent re-drive the parse beneath it, so work grew exponentially in
+        // the nesting depth and a short input exhausted memory. Recovery is now
+        // linear, so a deeply interleaved input parses quickly. Assert the node
+        // count stays proportional to the input rather than exploding.
+        let depth = 5000;
+        let src = format!("{}1{}", "if (1) {{ (".repeat(depth), ") }".repeat(depth));
+        let out = parse(&src);
+        let mut nodes = 0usize;
+        out.script.walk(&mut |_| nodes += 1);
+        // Linear recovery keeps this within a small multiple of the token count.
+        // Exponential behavior produced millions of nodes (or OOM) by depth ~50.
+        assert!(
+            nodes < depth * 20,
+            "node count {nodes} is not linear in depth {depth}"
+        );
+        assert!(out
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("deeply")));
+    }
+
+    #[test]
+    fn deeply_nested_expressions_are_bounded() {
+        // The same guard covers expression recursion via parse_primary.
+        let handle = std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                let depth = 100_000;
+                let src = format!("{}1{}", "(".repeat(depth), ")".repeat(depth));
+                let out = parse(&src);
+                out.errors
+                    .iter()
+                    .any(|e| format!("{e:?}").contains("deeply"))
+            })
+            .unwrap();
+        let hit_guard = handle.join().expect("parser must not overflow the stack");
+        assert!(hit_guard, "expected a depth-limit error");
+    }
+
+    /// A parenthesized rendering of the first statement's expression tree, for
+    /// asserting operator associativity and precedence.
+    fn expr_shape(src: &str) -> String {
+        fn show(n: &Node) -> String {
+            match &n.kind {
+                NodeKind::Binary { op, left, right } => {
+                    format!("({} {} {})", show(left), op, show(right))
+                }
+                NodeKind::Number(s) | NodeKind::BareWord(s) | NodeKind::Variable(s) => s.clone(),
+                NodeKind::Script(v) if v.len() == 1 => show(&v[0]),
+                NodeKind::Pipeline(v) if v.len() == 1 => show(&v[0]),
+                other => format!("{other:?}"),
+            }
+        }
+        let out = parse(src);
+        match &out.script.kind {
+            NodeKind::Script(v) => show(v.first().expect("a statement")),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn bitwise_and_comparison_share_one_precedence_tier() {
+        // PowerShell evaluates the comparison and bitwise operators in one
+        // left-associative tier, so these chain left to right.
+        assert_eq!(expr_shape("1 -bor 2 -eq 3"), "((1 -bor 2) -eq 3)");
+        assert_eq!(expr_shape("5 -band 6 -shl 1"), "((5 -band 6) -shl 1)");
+        assert_eq!(expr_shape("1 -bxor 2 -bor 3"), "((1 -bxor 2) -bor 3)");
+    }
+
+    #[test]
+    fn logical_binds_looser_than_bitwise() {
+        // -and / -or sit below the comparison and bitwise tier.
+        assert_eq!(expr_shape("1 -bor 2 -and 3"), "((1 -bor 2) -and 3)");
+    }
+
+    #[test]
+    fn arithmetic_binds_tighter_than_bitwise() {
+        // -band is tier 5; + is tier 6 (tighter), so the addition groups first.
+        assert_eq!(expr_shape("1 -band 2 + 3"), "(1 -band (2 + 3))");
+    }
+
+    #[test]
+    fn containment_and_type_operators_are_recognized() {
+        // -contains, -in, -is, -isnot begin with c/i, the case-sensitivity
+        // prefix letters. They still parse as binary comparison operators.
+        assert_eq!(expr_shape("1 -contains 2"), "(1 -contains 2)");
+        assert_eq!(expr_shape("1 -notcontains 2"), "(1 -notcontains 2)");
+        assert_eq!(expr_shape("1 -in 2"), "(1 -in 2)");
+        assert_eq!(expr_shape("1 -notin 2"), "(1 -notin 2)");
+        assert_eq!(expr_shape("1 -isnot 2"), "(1 -isnot 2)");
+    }
+
+    #[test]
+    fn comparison_operators_are_case_insensitive() {
+        // PowerShell accepts any case, plus the explicit c/i prefix forms.
+        assert_eq!(expr_shape("1 -EQ 2"), "(1 -EQ 2)");
+        assert_eq!(expr_shape("1 -cEq 2"), "(1 -cEq 2)");
+        assert_eq!(expr_shape("1 -iLike 2"), "(1 -iLike 2)");
+        assert_eq!(expr_shape("1 -CONTAINS 2"), "(1 -CONTAINS 2)");
+        // Previously the lexer classified `-cin` as a parameter, so the parser
+        // never saw it; the shared operator table fixed the spelling family.
+        assert_eq!(expr_shape("1 -cin 2"), "(1 -cin 2)");
+        assert_eq!(expr_shape("1 -csplit 2"), "(1 -csplit 2)");
+    }
+
+    #[test]
+    fn glued_star_is_multiplication_in_expression_position() {
+        // The lexer reads `*2` as a glob word; in expression position the
+        // parser splits it into `*` and a right operand.
+        let out = parse("$_*2\n");
+        assert!(out.errors.is_empty());
+        let mut found = None;
+        out.script.walk(&mut |n| {
+            if let NodeKind::Binary { op, right, .. } = &n.kind {
+                found = Some((op.clone(), right.span));
+            }
+        });
+        let (op, rhs) = found.expect("a Binary node");
+        assert_eq!(op, "*");
+        assert_eq!(rhs.slice("$_*2\n"), "2");
+
+        // Precedence composes: tier 7, same as spaced multiplication.
+        assert_eq!(expr_shape("1 + 2*3"), "(1 + (2 * 3))");
+        assert_eq!(expr_shape("1..2*3"), "((1 .. 2) * 3)");
+    }
+
+    /// Binary-node count and error count for a source snippet.
+    fn binaries_and_errors(src: &str) -> (usize, usize) {
+        let out = parse(src);
+        let mut binaries = 0;
+        out.script.walk(&mut |n| {
+            if matches!(n.kind, NodeKind::Binary { .. }) {
+                binaries += 1;
+            }
+        });
+        (binaries, out.errors.len())
+    }
+
+    #[test]
+    fn glued_star_chains_fold_left_associatively() {
+        // `$_*2*3` is (($_ * 2) * 3), as PowerShell groups it, not
+        // ($_ * (2 * 3)).
+        assert_eq!(expr_shape("2*3*4"), "((2 * 3) * 4)");
+        let (binaries, errors) = binaries_and_errors("$_*2*3\n");
+        assert_eq!((binaries, errors), (2, 0));
+        // A sign-wrapped segment is still a numeric literal: `-` is a word
+        // character, so `*-2` glues into the same token.
+        let (binaries, errors) = binaries_and_errors("$_*-2\n");
+        assert_eq!((binaries, errors), (1, 0));
+        let (binaries, errors) = binaries_and_errors("2*-3*4\n");
+        assert_eq!((binaries, errors), (2, 0));
+    }
+
+    #[test]
+    fn glued_star_bails_on_non_numeric_segments() {
+        // Bareword, trailing-star, and empty segments keep the wildcard
+        // reading instead of inventing a multiplication.
+        for src in ["$_*abc\n", "2*abc\n", "$_*2*\n", "$_**2\n"] {
+            let (binaries, errors) = binaries_and_errors(src);
+            assert_eq!(binaries, 0, "{src} must not become a Binary");
+            assert_eq!(errors, 0, "{src}");
+        }
+    }
+
+    #[test]
+    fn glued_star_suppressed_in_argument_position() {
+        // In argument position `$x*2` is a glob continuation. Spaced `*2` is
+        // a separate glob argument. Neither becomes a multiplication.
+        for src in ["dir $x*2\n", "dir $x *2\n", "cmd $a*3\n", "dir $a[0]*2\n"] {
+            let (binaries, errors) = binaries_and_errors(src);
+            assert_eq!(binaries, 0, "{src} must stay glob-shaped");
+            assert_eq!(errors, 0, "{src}");
+        }
+    }
+
+    #[test]
+    fn glued_star_active_inside_grouping_within_arguments() {
+        // Parens, script blocks, array and hashtable literals, index
+        // brackets, and method-call arguments re-enter expression context
+        // even when the construct itself is a command argument.
+        for src in [
+            "dir ($_*2)\n",
+            "dir { $_*2 }\n",
+            "dir @($_*2)\n",
+            "dir @{a=$_*2}\n",
+            "dir $a[$_*2]\n",
+            "dir $x.M($_*2)\n",
+        ] {
+            let (binaries, errors) = binaries_and_errors(src);
+            assert!(binaries >= 1, "{src} must multiply inside the grouping");
+            assert_eq!(errors, 0, "{src}");
+        }
+    }
+
+    #[test]
+    fn glued_star_does_not_touch_argument_globs() {
+        for src in ["dir *.log\n", "copy a* b\n", "*.log | x\n"] {
+            let out = parse(src);
+            assert!(out.errors.is_empty(), "{src}");
+            let mut binary = false;
+            out.script.walk(&mut |n| {
+                if matches!(n.kind, NodeKind::Binary { .. }) {
+                    binary = true;
+                }
+            });
+            assert!(!binary, "{src} must stay a command with glob arguments");
+        }
+    }
+
+    /// The bareword command names in source order, plus the error count.
+    fn command_names(src: &str) -> (usize, Vec<String>) {
+        let out = parse(src);
+        let mut names = Vec::new();
+        out.script.walk(&mut |n| {
+            if let NodeKind::Command { name, .. } = &n.kind {
+                if let NodeKind::BareWord(w) = &name.kind {
+                    names.push(w.clone());
+                }
+            }
+        });
+        (out.errors.len(), names)
+    }
+
+    #[test]
+    fn percent_and_question_are_commands_in_pipeline_position() {
+        // `%` and `?` are the ForEach-Object / Where-Object aliases. After a
+        // pipe (or at statement start) they name a command, not an operator.
+        let (errors, names) = command_names("1..10 | % { $_ * 2 }\n");
+        assert_eq!(errors, 0);
+        assert_eq!(names, ["%"]);
+
+        let (errors, names) = command_names("ls | ? { $_.Length } | % { $_ }\n");
+        assert_eq!(errors, 0);
+        assert_eq!(names, ["ls", "?", "%"]);
+
+        let (errors, names) = command_names("% { 1 }\n");
+        assert_eq!(errors, 0);
+        assert_eq!(names, ["%"]);
+    }
+
+    #[test]
+    fn modulo_and_ternary_still_parse_as_operators() {
+        // The alias handling is positional; expression uses are untouched.
+        assert_eq!(expr_shape("5 % 2"), "(5 % 2)");
+        let (errors, names) = command_names("$x = $true ? 1 : 2\n");
+        assert_eq!(errors, 0);
+        assert!(names.is_empty(), "ternary must not become a command");
     }
 }
