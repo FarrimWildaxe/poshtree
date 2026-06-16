@@ -33,6 +33,17 @@
 
 use super::ast::Node;
 use super::tokens::{Token, TokenKind};
+
+/// A token after which a statement continues onto the next line: the pipeline
+/// and chain operators. Shared by `line()` (which keeps such a continuation in
+/// one logical line) and `separator()` (which hangs it one indent level), so
+/// the two halves of the wrap behaviour cannot drift and reopen the
+/// continuation idempotency edge. Note `;` is deliberately not here: it
+/// separates independent statements and is handled on its own in each site.
+fn is_continuation_op(tok: &Token) -> bool {
+    matches!(tok.kind, TokenKind::Pipe | TokenKind::Comma)
+        || (tok.kind == TokenKind::Operator && matches!(tok.value.as_str(), "&&" | "||"))
+}
 use super::trivia::TriviaKind;
 use std::fmt;
 
@@ -288,10 +299,19 @@ fn fits<'a>(remaining: usize, docs: &'a [Doc], stack: &mut Vec<&'a Doc>) -> bool
     stack.clear();
     stack.extend(docs.iter().rev());
     while let Some(d) = stack.pop() {
+        // A string never fits in fewer columns than its character count, but
+        // counting characters walks the whole string. Byte length is an upper
+        // bound on that count, so once the bytes alone exceed the budget the
+        // exact count cannot fit either and `fits` stops without the walk.
         match d {
-            Doc::Text(s) => budget -= s.chars().count() as isize,
+            Doc::Text(s) => {
+                if (s.len() as isize) > budget {
+                    return false;
+                }
+                budget -= s.chars().count() as isize;
+            }
             Doc::Raw(s) => {
-                if s.contains('\n') {
+                if s.contains('\n') || (s.len() as isize) > budget {
                     return false;
                 }
                 budget -= s.chars().count() as isize;
@@ -550,7 +570,17 @@ impl<'a> Emitter<'a> {
                 break;
             }
             if !first && self.gaps[self.pos].newline_count() > 0 {
-                break; // a new line of this level starts here
+                // A newline normally ends the logical line. But when the
+                // previous token is a line-continuation operator (`|`, `,`,
+                // `&&`, `||`), the statement continues onto the next physical
+                // line, so keep it in this logical line and let `separator()`
+                // decide the wrap. Otherwise the indentation would differ
+                // between a freshly wrapped pipeline and one already wrapped in
+                // the source (the soft wrap hangs a level; an existing newline
+                // would break to the base indent), which is not idempotent.
+                if !is_continuation_op(&self.tokens[self.pos - 1]) {
+                    break; // a new line of this level starts here
+                }
             }
             if !first {
                 out.push(self.separator());
@@ -654,19 +684,18 @@ impl<'a> Emitter<'a> {
         if matches!(cur.kind, TokenKind::Comma | TokenKind::Semicolon) {
             return Doc::Text(String::new());
         }
-        // Breakable after pipeline and chain operators, commas, and
-        // semicolons: the safe continuation points. The Indent makes the
-        // continuation hang one level without deepening nested blocks.
-        let breakable = matches!(
-            prev.kind,
-            TokenKind::Pipe | TokenKind::Comma | TokenKind::Semicolon
-        ) || (prev.kind == TokenKind::Operator
-            && matches!(prev.value.as_str(), "&&" | "||"));
-        if breakable {
-            Doc::Indent(vec![Doc::Line])
-        } else {
-            Doc::Text(" ".into())
+        // Breakable after pipeline and chain operators and commas: these are
+        // continuations, so the Indent makes them hang one level. A semicolon
+        // separates independent statements at the same level, so it breaks to
+        // the current indent without an extra level; indenting it made the
+        // result depend on whether the break happened, which broke idempotency.
+        if is_continuation_op(prev) {
+            return Doc::Indent(vec![Doc::Line]);
         }
+        if prev.kind == TokenKind::Semicolon {
+            return Doc::Line;
+        }
+        Doc::Text(" ".into())
     }
 }
 
@@ -820,6 +849,51 @@ mod tests {
         match format_source("'unterminated\n") {
             Err(FormatError::Syntax { .. }) => {}
             other => panic!("expected Syntax error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrapped_continuations_with_here_strings_are_idempotent() {
+        // A `|`/`&&`/`||` continuation whose line contains a multi-line
+        // here-string forces a wrap. The wrap used to hang one level on the
+        // first pass but break to the base indent on the second (an existing
+        // newline after the operator was treated differently from a fresh
+        // wrap). The continuation now stays one logical line either way.
+        for src in [
+            "cmd @\"\nx\n\"@ | bar\n",
+            "$x | Get-Item @\"\ny\n\"@\n",
+            "foo @\"\nh\n\"@ | bar | baz\n",
+            "$a && cmd @\"\nx\n\"@\n",
+        ] {
+            let once = format_source(src).unwrap();
+            let twice = format_source(&once).unwrap();
+            assert_eq!(once, twice, "not idempotent: {src:?}");
+        }
+        // A comma list with a here-string element reshapes the tree, so the
+        // safety guard declines it. Declining is stable: the caller keeps the
+        // original both times.
+        let comma = "a, @\"\nx\n\"@, b\n";
+        assert!(
+            format_source(comma).is_err(),
+            "comma+here-string should decline"
+        );
+    }
+
+    #[test]
+    fn semicolon_separated_statements_are_idempotent() {
+        // A `;` separates independent statements at the same indent. It used to
+        // hang one level when it broke, so a here-string argument (which forces
+        // a break) produced 4 vs 0 leading spaces across passes.
+        for src in [
+            "0; -d @\"\nx\n\"@\n",
+            "$x = 1; Get-Item @\"\ndata\n\"@\n",
+            "$a = 1; $b = 2\n",
+            "ls; cd; pwd\n",
+            "foo | bar; baz\n",
+        ] {
+            let once = format_source(src).unwrap();
+            let twice = format_source(&once).unwrap();
+            assert_eq!(once, twice, "not idempotent: {src:?}");
         }
     }
 

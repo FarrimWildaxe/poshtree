@@ -205,6 +205,9 @@ impl std::error::Error for LexError {}
 // the copies equal, so the two lexers agree on every keyword and dash-word.
 
 /// Named operators, compared case-insensitively, without the leading hyphen.
+/// Base names only: the `c`/`i` case-prefixed comparison spellings (`ceq`,
+/// `imatch`, ...) are derived in the crate-private `ops` module rather than
+/// listed here.
 pub const NAMED_OPERATORS: &[&str] = &[
     "eq",
     "ne",
@@ -237,30 +240,6 @@ pub const NAMED_OPERATORS: &[&str] = &[
     "join",
     "split",
     "f",
-    "ceq",
-    "cne",
-    "cgt",
-    "cge",
-    "clt",
-    "cle",
-    "clike",
-    "cnotlike",
-    "cmatch",
-    "cnotmatch",
-    "creplace",
-    "ccontains",
-    "cnotcontains",
-    "ieq",
-    "ine",
-    "igt",
-    "ige",
-    "ilt",
-    "ile",
-    "ilike",
-    "inotlike",
-    "imatch",
-    "inotmatch",
-    "ireplace",
 ];
 
 /// Keywords, compared case-insensitively. Context sensitivity (e.g. `in`

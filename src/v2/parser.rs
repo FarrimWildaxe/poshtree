@@ -265,10 +265,7 @@ impl Parser<'_> {
             | T::LBrace
             | T::LBracket => true,
             T::Comma => true,
-            T::Operator => matches!(
-                self.lower().as_str(),
-                "-" | "+" | "!" | "-not" | "-bnot" | "++" | "--"
-            ),
+            T::Operator => is_unary_operator_word(&self.lower()),
             _ => false,
         }
     }
@@ -393,6 +390,36 @@ impl Parser<'_> {
     }
 
     fn parse_statement_inner(&mut self) -> Node {
+        // A loop/switch label: `:outer foreach (...) { ... }`. The lexer emits
+        // `:` then a word. PowerShell allows a label only before a loop or
+        // `switch`, so require one of those keywords two tokens ahead before
+        // wrapping; otherwise `:` is left to parse as it otherwise would, and a
+        // bare command like `:lbl Get-Process` is not mistaken for a label.
+        if self.at_op(":") && self.peek_kind() == T::Generic {
+            let after_label = self.peek_n(2);
+            let is_labelable = after_label.kind == T::Keyword
+                && matches!(
+                    after_label.value.to_ascii_lowercase().as_str(),
+                    "for" | "foreach" | "while" | "do" | "switch"
+                );
+            if is_labelable {
+                let start = self.pos;
+                self.bump(); // ':'
+                let label = self.value().to_string();
+                let label_span = self.tokens[self.pos].span;
+                self.bump(); // label word
+                let statement = self.parse_statement();
+                return self.make(
+                    NodeKind::Labeled {
+                        label,
+                        label_span,
+                        statement: Box::new(statement),
+                    },
+                    start,
+                    self.pos,
+                );
+            }
+        }
         if self.at(T::Keyword) {
             match self.lower().as_str() {
                 "if" => return self.parse_if(),
@@ -429,6 +456,13 @@ impl Parser<'_> {
     fn peek_kind(&self) -> T {
         let next = (self.pos + 1).min(self.tokens.len() - 1);
         self.tokens[next].kind
+    }
+
+    /// The token `n` positions ahead of the cursor (0 = current), clamped to
+    /// the final token.
+    fn peek_n(&self, n: usize) -> &Token {
+        let i = (self.pos + n).min(self.tokens.len() - 1);
+        &self.tokens[i]
     }
 
     fn peek_is_lparen(&self) -> bool {
@@ -817,16 +851,42 @@ impl Parser<'_> {
     fn parse_switch(&mut self) -> Node {
         let start = self.pos;
         self.bump();
-        // Options like -Regex, -Wildcard, -File <path> tune how cases match;
-        // they add nothing to the tree shape, and v1 drops them too, so they
-        // are consumed here rather than modeled.
+        // Options before the input: `-Regex`, `-Wildcard`, `-CaseSensitive`,
+        // `-Exact` are switches; `-File <path>` takes a path that becomes the
+        // input. Each is captured as a CommandParameter. Only `-File` consumes
+        // a following value, so the others do not swallow the `(...)` input.
+        let mut flags = Vec::new();
+        let mut file_input = None;
         while self.at(T::Parameter) {
+            let p_start = self.pos;
+            let name = self.value().trim_start_matches('-').to_string();
             self.bump();
-            if self.is_value_start() {
-                let _ = self.parse_command_argument();
+            let is_file = name.eq_ignore_ascii_case("file");
+            // `-File <path>` consumes the path, which becomes the switch input.
+            // The flag itself records only its presence, so the path is not
+            // duplicated as both the flag's argument and the input.
+            let path = if is_file && self.is_value_start() {
+                Some(self.parse_command_argument())
+            } else {
+                None
+            };
+            let flag = self.make(
+                NodeKind::CommandParameter {
+                    name,
+                    argument: None,
+                },
+                p_start,
+                self.pos,
+            );
+            flags.push(flag);
+            if let Some(p) = path {
+                file_input = Some(p);
             }
         }
-        let input = if self.at(T::LParen) {
+        let input = if let Some(f) = file_input {
+            // `-File <path>`: the path is the input.
+            f
+        } else if self.at(T::LParen) {
             self.bump();
             let e = self.parse_pipeline_statement();
             self.expect(T::RParen, "')'");
@@ -839,6 +899,7 @@ impl Parser<'_> {
         let body = self.parse_braced_block();
         self.make(
             NodeKind::Switch {
+                flags,
                 input: Box::new(input),
                 cases: vec![body],
             },
@@ -860,12 +921,22 @@ impl Parser<'_> {
             String::new()
         };
         let name_span = self.span_of(name_pos, self.pos);
+        // An optional `function f(...)` parameter list before the body. The
+        // alternative `param(...)` block lives inside the body and is handled
+        // there; a function uses one form or the other.
+        let parameters = if self.at(T::LParen) {
+            self.bump();
+            self.parse_param_decl_list()
+        } else {
+            Vec::new()
+        };
         let body = self.parse_braced_block();
         self.make(
             NodeKind::Function {
                 name,
                 name_span,
                 filter,
+                parameters,
                 body: Box::new(body),
             },
             start,
@@ -982,14 +1053,19 @@ impl Parser<'_> {
             || matches!(self.kind(), T::RBrace | T::RParen)
     }
 
-    fn read_name_token(&mut self) -> String {
+    /// Reads a declaration name token, returning its text and source span. The
+    /// span is empty (start == end at the current position) when no name is
+    /// present, so rename tooling can skip it harmlessly.
+    fn read_name_token_spanned(&mut self) -> (String, Span) {
         if matches!(self.kind(), T::Generic | T::Keyword) {
+            let span = self.tokens[self.pos].span;
             let v = self.value().to_string();
             self.bump();
-            v
+            (v, span)
         } else {
             self.error("expected name");
-            String::new()
+            let at = self.tokens.get(self.pos).map_or(0, |t| t.span.start);
+            (String::new(), Span::new(at, at))
         }
     }
 
@@ -1005,7 +1081,7 @@ impl Parser<'_> {
     fn parse_enum(&mut self) -> Node {
         let start = self.pos;
         self.bump(); // enum
-        let name = self.read_name_token();
+        let (name, name_span) = self.read_name_token_spanned();
         let mut base = String::new();
         if self.at_op(":") {
             self.bump();
@@ -1051,6 +1127,7 @@ impl Parser<'_> {
         self.make(
             NodeKind::EnumDefinition {
                 name,
+                name_span,
                 base,
                 members,
             },
@@ -1062,7 +1139,7 @@ impl Parser<'_> {
     fn parse_class(&mut self) -> Node {
         let start = self.pos;
         self.bump(); // class
-        let name = self.read_name_token();
+        let (name, name_span) = self.read_name_token_spanned();
         let mut bases = Vec::new();
         if self.at_op(":") {
             self.bump();
@@ -1100,6 +1177,7 @@ impl Parser<'_> {
         self.make(
             NodeKind::ClassDefinition {
                 name,
+                name_span,
                 bases,
                 members,
             },
@@ -1268,33 +1346,66 @@ impl Parser<'_> {
         let start = self.pos;
         self.bump(); // param
         self.expect(T::LParen, "'('");
-        // Like v1: scan to the matching ')', emitting a Variable for every
-        // Variable token and ignoring types, defaults, and attributes.
-        let mut depth = 1usize;
+        let params = self.parse_param_decl_list();
+        self.make(NodeKind::ParamBlock(params), start, self.pos)
+    }
+
+    /// Parses `param_decl (',' param_decl)* ')'`, with the opening `(` already
+    /// consumed. A malformed entry is skipped past so the list still
+    /// terminates. Shared by the `param(...)` block and the `function f(...)`
+    /// parameter list.
+    fn parse_param_decl_list(&mut self) -> Vec<Node> {
         let mut params = Vec::new();
-        while !self.at_end() && depth > 0 {
-            match self.kind() {
-                T::LParen => {
-                    depth += 1;
-                    self.bump();
-                }
-                T::RParen => {
-                    depth -= 1;
-                    self.bump();
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                T::Variable => {
-                    let raw = self.value().to_string();
-                    params.push(self.leaf(NodeKind::Variable(raw)));
-                }
-                _ => {
-                    self.bump();
-                }
+        while !self.at_end() && !self.at(T::RParen) {
+            if let Some(p) = self.parse_param_decl() {
+                params.push(p);
+            }
+            if self.at(T::Comma) {
+                self.bump();
+            } else if !self.at(T::RParen) {
+                self.bump(); // stall guard: drop a stray token
             }
         }
-        self.make(NodeKind::ParamBlock(params), start, self.pos)
+        self.expect(T::RParen, "')'");
+        params
+    }
+
+    /// Parses one parameter declaration: `[attr][type] $name [= default]`.
+    /// Returns `None` when no variable is found (a malformed entry), after
+    /// consuming the brackets so the caller's loop still advances.
+    fn parse_param_decl(&mut self) -> Option<Node> {
+        let start = self.pos;
+        let mut attributes = Vec::new();
+        // Leading `[...]` brackets: attributes and the type, kept in order.
+        while self.at(T::LBracket) {
+            let (text, open) = self.parse_bracket_type();
+            attributes.push(self.make(NodeKind::TypeExpression(text), open, self.pos));
+        }
+        if !self.at(T::Variable) {
+            return None;
+        }
+        let name = self.value().to_string();
+        let name_span = self.tokens[self.pos].span;
+        self.bump();
+        // Optional default: `= <expression>`. Use the ternary level, not the
+        // full expression, so a top-level comma separates parameters rather
+        // than being read as an array element of this default.
+        let default = if self.at_op("=") {
+            self.bump();
+            Some(Box::new(self.parse_ternary()))
+        } else {
+            None
+        };
+        Some(self.make(
+            NodeKind::Parameter {
+                attributes,
+                name,
+                name_span,
+                default,
+            },
+            start,
+            self.pos,
+        ))
     }
 
     // Expressions
@@ -1481,10 +1592,7 @@ impl Parser<'_> {
         }
         if self.at(T::Operator) {
             let tok = &self.tokens[self.pos];
-            let is_unary_op = ["-", "+", "!", "-not", "-bnot", "++", "--"]
-                .iter()
-                .any(|s| tok.value_eq_ci(s));
-            if is_unary_op {
+            if is_unary_operator_word(&tok.value.to_ascii_lowercase()) {
                 let op = self.value().to_string();
                 self.bump();
                 let operand = self.parse_unary();
@@ -2003,6 +2111,27 @@ fn extract_interpolations(inner: &str, base: usize, idx: usize) -> Vec<Node> {
 /// (offsets relative to that substring) into the coordinates of the original
 /// source. The token range is set to the string token's placeholder, since the
 /// sub-expression's tokens are not part of the outer token stream.
+/// Whether a dash-word (lowercased) is a prefix-unary operator. Shared by
+/// `is_value_start` (to route the expression) and `parse_unary` (to build the
+/// node), so the two cannot disagree about what begins a unary expression.
+/// `-split` and `-join` have unary forms; `-split` also takes a `c`/`i` case
+/// prefix, `-join` does not.
+fn is_unary_operator_word(word: &str) -> bool {
+    matches!(
+        word,
+        "-" | "+"
+            | "!"
+            | "-not"
+            | "-bnot"
+            | "++"
+            | "--"
+            | "-split"
+            | "-csplit"
+            | "-isplit"
+            | "-join"
+    )
+}
+
 /// Peels single-statement `Script`/`Pipeline` wrappers off a re-parsed
 /// fragment, yielding the one expression inside, or `None` when the fragment
 /// is not exactly one expression.
@@ -2961,20 +3090,22 @@ mod tests {
     /// A parenthesized rendering of the first statement's expression tree, for
     /// asserting operator associativity and precedence.
     fn expr_shape(src: &str) -> String {
-        fn show(n: &Node) -> String {
+        fn show(n: &Node, src: &str) -> String {
             match &n.kind {
                 NodeKind::Binary { op, left, right } => {
-                    format!("({} {} {})", show(left), op, show(right))
+                    format!("({} {} {})", show(left, src), op, show(right, src))
                 }
+                NodeKind::Unary { op, operand } => format!("U({op} {})", show(operand, src)),
                 NodeKind::Number(s) | NodeKind::BareWord(s) | NodeKind::Variable(s) => s.clone(),
-                NodeKind::Script(v) if v.len() == 1 => show(&v[0]),
-                NodeKind::Pipeline(v) if v.len() == 1 => show(&v[0]),
+                NodeKind::StringLiteral { .. } => n.span.slice(src).to_string(),
+                NodeKind::Script(v) if v.len() == 1 => show(&v[0], src),
+                NodeKind::Pipeline(v) if v.len() == 1 => show(&v[0], src),
                 other => format!("{other:?}"),
             }
         }
         let out = parse(src);
         match &out.script.kind {
-            NodeKind::Script(v) => show(v.first().expect("a statement")),
+            NodeKind::Script(v) => show(v.first().expect("a statement"), src),
             _ => unreachable!(),
         }
     }
@@ -3157,6 +3288,189 @@ mod tests {
         let (errors, names) = command_names("% { 1 }\n");
         assert_eq!(errors, 0);
         assert_eq!(names, ["%"]);
+    }
+
+    #[test]
+    fn function_paren_parameter_list_is_parsed() {
+        // `function f(...)` parameters parse into the same Parameter nodes as a
+        // `param(...)` block; a `param(...)` block stays distinct.
+        fn fn_params(src: &str) -> usize {
+            let out = parse(src);
+            let mut n = 0;
+            out.script.walk(&mut |x| {
+                if let NodeKind::Function { parameters, .. } = &x.kind {
+                    n = parameters.len();
+                }
+            });
+            n
+        }
+        let out = parse("function f($a, [int]$b = 1) { }\n");
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(fn_params("function f($a, [int]$b = 1) { }\n"), 2);
+        assert_eq!(fn_params("filter g([string]$s) { $s }\n"), 1);
+        assert_eq!(fn_params("function NoP { 1 }\n"), 0);
+        // A param() block is not a function-paren list.
+        assert_eq!(fn_params("function f { param([int]$n) $n }\n"), 0);
+    }
+
+    #[test]
+    fn param_block_models_attributes_types_and_defaults() {
+        // `param(...)` entries used to collapse to bare variables; each is now
+        // a Parameter node carrying its `[...]` brackets and default.
+        fn params(src: &str) -> Vec<(usize, bool, String)> {
+            let out = parse(src);
+            let mut v = Vec::new();
+            out.script.walk(&mut |n| {
+                if let NodeKind::Parameter {
+                    attributes,
+                    default,
+                    name,
+                    ..
+                } = &n.kind
+                {
+                    v.push((attributes.len(), default.is_some(), name.clone()));
+                }
+            });
+            v
+        }
+        assert_eq!(
+            params("function f { param([int]$n) }\n"),
+            vec![(1, false, "$n".into())]
+        );
+        assert_eq!(
+            params("function f { param([Parameter(Mandatory)][int]$n) }\n"),
+            vec![(2, false, "$n".into())]
+        );
+        // Two parameters, each with a default, split on the top-level comma.
+        assert_eq!(
+            params("param([string]$x = 'hi', [int]$y = 5)\n"),
+            vec![(1, true, "$x".into()), (1, true, "$y".into())]
+        );
+        assert_eq!(params("param($plain)\n"), vec![(0, false, "$plain".into())]);
+    }
+
+    #[test]
+    fn switch_file_path_appears_once_in_the_tree() {
+        // The -File path is the switch input; it must not also be stored as the
+        // flag's argument, or a walk would visit it twice.
+        let src = "switch -File 'data.txt' { 'x' { 1 } }\n";
+        let out = parse(src);
+        assert!(out.errors.is_empty());
+        let mut path_hits = 0;
+        let mut flag_count = 0;
+        out.script.walk(&mut |n| match &n.kind {
+            NodeKind::StringLiteral { .. } if n.span.slice(src) == "'data.txt'" => {
+                path_hits += 1;
+            }
+            NodeKind::Switch { flags, input, .. } => {
+                flag_count = flags.len();
+                assert_eq!(input.span.slice(src), "'data.txt'", "input is the path");
+            }
+            _ => {}
+        });
+        assert_eq!(path_hits, 1, "the -File path must appear exactly once");
+        assert_eq!(flag_count, 1, "the -File flag is still recorded");
+    }
+
+    #[test]
+    fn switch_flags_are_modeled_and_do_not_break_the_input() {
+        // `-Regex` and friends used to make the input parse fail; they are now
+        // captured as flags, and `-File` takes the path as the input.
+        let plain = parse("switch ($x) { 1 { 'a' } }\n");
+        let mut n = 0;
+        plain.script.walk(&mut |x| {
+            if let NodeKind::Switch { flags, .. } = &x.kind {
+                n = flags.len();
+            }
+        });
+        assert!(plain.errors.is_empty());
+        assert_eq!(n, 0);
+
+        let regex = parse("switch -Regex ($x) { 'a.' { 1 } }\n");
+        assert!(regex.errors.is_empty(), "{:?}", regex.errors);
+        regex.script.walk(&mut |x| {
+            if let NodeKind::Switch { flags, .. } = &x.kind {
+                assert_eq!(flags.len(), 1);
+            }
+        });
+
+        let two = parse("switch -Wildcard -CaseSensitive ($x) { 'a*' { 1 } }\n");
+        assert!(two.errors.is_empty());
+        two.script.walk(&mut |x| {
+            if let NodeKind::Switch { flags, .. } = &x.kind {
+                assert_eq!(flags.len(), 2);
+            }
+        });
+
+        let file = parse("switch -File 'data.txt' { 'x' { 1 } }\n");
+        assert!(file.errors.is_empty(), "{:?}", file.errors);
+    }
+
+    #[test]
+    fn labels_only_wrap_loops_and_switch() {
+        // A label before a loop or switch wraps it; a label before a bare
+        // command does not (PowerShell allows labels only on loops/switch).
+        fn is_labeled(src: &str) -> bool {
+            let mut found = false;
+            parse(src).script.walk(&mut |n| {
+                if matches!(n.kind, NodeKind::Labeled { .. }) {
+                    found = true;
+                }
+            });
+            found
+        }
+        assert!(is_labeled(":outer foreach ($i in 1..3) { break outer }\n"));
+        assert!(is_labeled(":sw switch ($x) { 1 { } }\n"));
+        assert!(
+            !is_labeled(":lbl Get-Process\n"),
+            "command must not be labeled"
+        );
+        assert!(!is_labeled(":foo bar\n"), "bareword must not be labeled");
+        // The non-label cases still parse without error.
+        assert!(parse(":lbl Get-Process\n").errors.is_empty());
+    }
+
+    #[test]
+    fn labeled_loops_parse() {
+        // A label before a loop or switch wraps it in a Labeled node; the
+        // ternary colon is not mistaken for a label.
+        for (src, kw) in [
+            (":outer foreach ($i in 1..3) { break outer }\n", "foreach"),
+            (":x while ($y) { }\n", "while"),
+            (":lbl for ($i = 0; $i -lt 3; $i++) { }\n", "for"),
+            (":sw switch ($x) { 1 { } }\n", "switch"),
+        ] {
+            let out = parse(src);
+            assert!(out.errors.is_empty(), "{kw}: {:?}", out.errors);
+            let mut label = None;
+            out.script.walk(&mut |n| {
+                if let NodeKind::Labeled { label: l, .. } = &n.kind {
+                    label = Some(l.clone());
+                }
+            });
+            assert!(label.is_some(), "{kw} should be labeled");
+        }
+        let ternary = parse("$x = $a ? 1 : 2\n");
+        let mut labeled = false;
+        ternary.script.walk(&mut |n| {
+            if matches!(n.kind, NodeKind::Labeled { .. }) {
+                labeled = true;
+            }
+        });
+        assert!(!labeled, "ternary colon is not a label");
+    }
+
+    #[test]
+    fn unary_split_and_join_parse_at_expression_start() {
+        // `-split`/`-join` have unary forms; at a value position they build a
+        // Unary node, while the binary forms (with a left operand) are
+        // unaffected.
+        assert_eq!(expr_shape("-split 'a b'"), "U(-split 'a b')");
+        assert_eq!(expr_shape("-join $a"), "U(-join $a)");
+        assert_eq!(expr_shape("-csplit 'a b'"), "U(-csplit 'a b')");
+        // Binary forms keep their shape.
+        assert_eq!(expr_shape("'a b' -split ' '"), "('a b' -split ' ')");
+        assert_eq!(expr_shape("$a -join ','"), "($a -join ',')");
     }
 
     #[test]

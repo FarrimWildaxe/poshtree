@@ -137,16 +137,46 @@ fn rename_member_named(
 pub(super) fn edits_from_spans(mut spans: Vec<Span>, to: &str) -> Vec<TextEdit> {
     spans.sort_by_key(|s| (s.start, s.end));
     spans.dedup();
-    spans
-        .into_iter()
-        .map(|s| TextEdit::replace(s, to))
-        .collect()
+    // `dedup` removes identical spans; also drop a span fully covered by one
+    // already kept. Sorted by (start, end), any covering span starts no later,
+    // so tracking the furthest end seen so far is enough: a span ending within
+    // it is contained and skipped. This keeps a benign double collection (the
+    // same site reached by two paths) from reaching the applier as an overlap
+    // error, while genuinely disjoint spans are all kept.
+    let mut kept: Vec<Span> = Vec::with_capacity(spans.len());
+    let mut covered_to = 0usize;
+    for s in spans {
+        if !kept.is_empty() && s.end <= covered_to {
+            continue; // contained in some earlier span
+        }
+        covered_to = covered_to.max(s.end);
+        kept.push(s);
+    }
+    kept.into_iter().map(|s| TextEdit::replace(s, to)).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::v2::{apply_edits, parse, NodeKind};
+
+    #[test]
+    fn edits_from_spans_drops_identical_and_contained_spans() {
+        // Identical spans collapse, and a span fully inside another is dropped,
+        // so a benign double collection does not reach the applier as overlap.
+        let spans = vec![
+            Span::new(0, 10),
+            Span::new(0, 10), // identical
+            Span::new(2, 5),  // contained in [0,10]
+            Span::new(10, 12),
+            Span::new(20, 25),
+            Span::new(22, 24), // contained in [20,25]
+        ];
+        let edits = edits_from_spans(spans, "X");
+        let ranges: Vec<(usize, usize)> =
+            edits.iter().map(|e| (e.span.start, e.span.end)).collect();
+        assert_eq!(ranges, vec![(0, 10), (10, 12), (20, 25)]);
+    }
 
     /// Parse PowerShell, find its first Add-Type node, return (src, node).
     fn add_type(src: &str) -> Node {

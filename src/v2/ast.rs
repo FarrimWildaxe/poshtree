@@ -80,7 +80,11 @@ pub struct Node {
 
 /// The shape of a [`Node`]. Statement and expression variants share one enum,
 /// matching how PowerShell blends the two.
+///
+/// Marked `#[non_exhaustive]`: future versions may add variants, so downstream
+/// matches need a wildcard arm. Within this crate, matches stay exhaustive.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum NodeKind {
     // Containers
     /// A script block body: a sequence of statements. The tree root.
@@ -192,7 +196,12 @@ pub enum NodeKind {
     },
     /// `switch (input) { ... }`. Cases are kept as raw child nodes.
     Switch {
-        /// The switch input expression.
+        /// Switch options before the input: `-Regex`, `-Wildcard`,
+        /// `-CaseSensitive`, `-Exact`, `-File <path>`, in source order. `-File`
+        /// keeps its path argument; the others are flags.
+        flags: Vec<Node>,
+        /// The switch input expression (the `(...)` value, or the `-File`
+        /// path when the input comes from a file).
         input: Box<Node>,
         /// Case label expressions and their bodies, in source order.
         cases: Vec<Node>,
@@ -206,6 +215,10 @@ pub enum NodeKind {
         name_span: Span,
         /// True for `filter`, false for `function`.
         filter: bool,
+        /// Parameters from a `function f(...)` list, empty when the function
+        /// uses a `param(...)` block inside the body or takes none. Each is a
+        /// [`Parameter`](NodeKind::Parameter) node.
+        parameters: Vec<Node>,
         /// The function body.
         body: Box<Node>,
     },
@@ -234,6 +247,8 @@ pub enum NodeKind {
     ClassDefinition {
         /// The class name.
         name: String,
+        /// Span of the name identifier, for rename tooling.
+        name_span: Span,
         /// Base types and interfaces.
         bases: Vec<String>,
         /// Parsed members (properties, methods, constructors).
@@ -256,6 +271,8 @@ pub enum NodeKind {
     EnumDefinition {
         /// The enum name.
         name: String,
+        /// Span of the name identifier, for rename tooling.
+        name_span: Span,
         /// The optional backing type.
         base: String,
         /// Enum members.
@@ -268,6 +285,33 @@ pub enum NodeKind {
         keyword: String,
         /// The optional value expression.
         value: Option<Box<Node>>,
+    },
+
+    /// A single parameter in a `param(...)` block or function parameter list:
+    /// `[Parameter(Mandatory)][int]$Name = $default`. Attribute and type
+    /// brackets are kept as `TypeExpression` nodes in `attributes` (the
+    /// conventional type is the last one without `(` in its text); `default`
+    /// holds the initializer expression when present.
+    Parameter {
+        /// `[...]` brackets before the name, in source order.
+        attributes: Vec<Node>,
+        /// The parameter variable name, including the leading `$`.
+        name: String,
+        /// Span of the name token.
+        name_span: Span,
+        /// The default value expression, if any.
+        default: Option<Box<Node>>,
+    },
+
+    /// A labeled statement: `:outer foreach (...) { ... }`. The label is the
+    /// target of a `break`/`continue` naming it.
+    Labeled {
+        /// The label name (without the leading `:`).
+        label: String,
+        /// Span of the label name, for tooling.
+        label_span: Span,
+        /// The labeled statement (a loop or switch).
+        statement: Box<Node>,
     },
 
     // Expressions
@@ -405,6 +449,9 @@ impl Node {
                 "throw" => "ThrowStatement",
                 _ => "FlowStatement",
             },
+
+            Labeled { .. } => "LabeledStatement",
+            Parameter { .. } => "Parameter",
             Ternary { .. } => "TernaryExpression",
             Binary { .. } => "BinaryExpression",
             Unary { .. } => "UnaryExpression",
@@ -532,13 +579,27 @@ impl Node {
                 f(iterable);
                 f(body);
             }
-            Switch { input, cases } => {
+            Switch {
+                flags,
+                input,
+                cases,
+            } => {
+                for n in flags {
+                    f(n);
+                }
                 f(input);
                 for n in cases {
                     f(n);
                 }
             }
-            Function { body, .. } => f(body),
+            Function {
+                parameters, body, ..
+            } => {
+                for prm in parameters {
+                    f(prm);
+                }
+                f(body);
+            }
             Try {
                 body,
                 catches,
@@ -572,6 +633,19 @@ impl Node {
             Flow { value, .. } => {
                 if let Some(v) = value {
                     f(v);
+                }
+            }
+            Labeled { statement, .. } => f(statement),
+            Parameter {
+                attributes,
+                default,
+                ..
+            } => {
+                for a in attributes {
+                    f(a);
+                }
+                if let Some(d) = default {
+                    f(d);
                 }
             }
             Ternary {
@@ -722,13 +796,27 @@ impl Node {
                 f(iterable);
                 f(body);
             }
-            Switch { input, cases } => {
+            Switch {
+                flags,
+                input,
+                cases,
+            } => {
+                for n in flags {
+                    f(n);
+                }
                 f(input);
                 for n in cases {
                     f(n);
                 }
             }
-            Function { body, .. } => f(body),
+            Function {
+                parameters, body, ..
+            } => {
+                for prm in parameters {
+                    f(prm);
+                }
+                f(body);
+            }
             Try {
                 body,
                 catches,
@@ -762,6 +850,19 @@ impl Node {
             Flow { value, .. } => {
                 if let Some(v) = value {
                     f(v);
+                }
+            }
+            Labeled { statement, .. } => f(statement),
+            Parameter {
+                attributes,
+                default,
+                ..
+            } => {
+                for a in attributes {
+                    f(a);
+                }
+                if let Some(d) = default {
+                    f(d);
                 }
             }
             Ternary {

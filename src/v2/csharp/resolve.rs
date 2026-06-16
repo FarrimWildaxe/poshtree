@@ -18,7 +18,7 @@
 
 use super::ast::{CsName, CsNode, CsNodeKind, CsUnit};
 use crate::v2::span::Span;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// What a declaration introduces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +119,11 @@ pub struct Resolved {
     member_refs: Vec<MemberRef>,
     /// For each scope id, the name of the nearest enclosing type, if any.
     type_of_scope: Vec<Option<String>>,
+    /// type name -> base type/interface names, for inheritance-aware binding.
+    parents: HashMap<String, Vec<String>>,
+    /// owner type name -> the member names it directly declares, for an O(1)
+    /// `type_declares` lookup instead of scanning every declaration.
+    members: HashMap<String, HashSet<String>>,
 }
 
 impl Resolved {
@@ -215,20 +220,68 @@ impl Resolved {
     }
 
     /// Whether a member-access receiver can only denote the current member's
-    /// owner. `this` qualifies only when the reference sits inside the owner
-    /// type's own body, so a same-named member of another type does not capture
-    /// it. `base` never binds: it names a member of a parent type, and this
-    /// single-file model has no inheritance information, so guessing would
-    /// attach the reference to the wrong declaration. A bare-name receiver
-    /// qualifies when it is the declaring type's name (static access), from
-    /// anywhere. An unknown receiver (`None`) never qualifies.
+    /// owner. `this` qualifies for a member of the enclosing type or one it
+    /// inherits, binding to the most-derived declarer so a shadowed member
+    /// renames against the shadowing type. `base.X` binds to the nearest
+    /// ancestor that declares `X`, via the type-to-bases map; an external base
+    /// (not present in the unit) ends the chain without binding. A bare-name
+    /// receiver qualifies when it is the declaring type's name (static access),
+    /// from anywhere. An unknown receiver (`None`) never qualifies.
     fn receiver_is_this_member(&self, m: &MemberRef, owner: Option<&str>) -> bool {
+        let Some(owner) = owner else {
+            return false;
+        };
+        let enclosing = m.enclosing_type.as_deref();
         match m.receiver.as_deref() {
-            Some("this") => owner.is_some() && m.enclosing_type.as_deref() == owner,
-            Some("base") => false,
-            Some(r) => owner == Some(r),
+            // `this.X` binds to the most-derived type on the enclosing type's
+            // chain (itself included) that declares `X`. This makes a shadowed
+            // member rename against the shadowing type, not the base.
+            Some("this") => {
+                enclosing.is_some_and(|e| self.nearest_decl_of(e, &m.text) == Some(owner))
+            }
+            // `base.X` skips the enclosing type: it binds to the most-derived
+            // ancestor (strictly above) that declares `X`.
+            Some("base") => enclosing
+                .and_then(|e| self.parents.get(e))
+                .into_iter()
+                .flatten()
+                .any(|b| self.nearest_decl_of(b, &m.text) == Some(owner)),
+            // A named receiver matching the owner (e.g. a same-type static use).
+            Some(r) => r == owner,
             None => false,
         }
+    }
+
+    /// The nearest type on `ty`'s chain (starting at `ty` itself) that declares
+    /// a member named `member`, or `None` if no visible type on the chain does.
+    /// Breadth-first so the most-derived declarer wins; the visited set guards
+    /// cyclic bases.
+    fn nearest_decl_of<'a>(&'a self, ty: &'a str, member: &str) -> Option<&'a str> {
+        let mut queue = std::collections::VecDeque::from([ty]);
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(cur) = queue.pop_front() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            if self.type_declares(cur, member) {
+                return Some(cur);
+            }
+            if let Some(bases) = self.parents.get(cur) {
+                for b in bases {
+                    queue.push_back(b.as_str());
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether type `ty` directly declares a member named `member`. Two borrow
+    /// lookups against the index built in `into_resolved`: constant time, no
+    /// per-call allocation.
+    fn type_declares(&self, ty: &str, member: &str) -> bool {
+        self.members
+            .get(ty)
+            .is_some_and(|names| names.contains(member))
     }
 }
 
@@ -239,6 +292,7 @@ pub fn resolve(unit: &CsUnit) -> Resolved {
         decls: Vec::new(),
         refs: Vec::new(),
         type_of_scope: Vec::new(),
+        parents: HashMap::new(),
     };
     let root = b.new_scope(None, ScopeKind::Unit);
     for c in &unit.root.children {
@@ -252,6 +306,8 @@ struct Builder {
     decls: Vec<Decl>,
     refs: Vec<RefSite>,
     type_of_scope: Vec<Option<String>>,
+    /// type name -> its declared base type/interface names.
+    parents: HashMap<String, Vec<String>>,
 }
 
 impl Builder {
@@ -287,8 +343,14 @@ impl Builder {
 
     fn build(&mut self, node: &CsNode, scope: usize) {
         match &node.kind {
-            CsNodeKind::Type { name, .. } => {
+            CsNodeKind::Type { name, bases, .. } => {
                 self.add(scope, DeclKind::Type, name);
+                if !bases.is_empty() {
+                    self.parents
+                        .entry(name.text.clone())
+                        .or_default()
+                        .extend(bases.iter().map(|b| b.text.clone()));
+                }
                 let inner = self.new_scope(Some(scope), ScopeKind::Type);
                 self.type_of_scope[inner] = Some(name.text.clone());
                 self.build_children(node, inner);
@@ -379,11 +441,28 @@ impl Builder {
                 root_refs[id].push(r.span);
             }
         }
+        // Index the members each type declares, for inheritance lookups.
+        let mut members: HashMap<String, HashSet<String>> = HashMap::new();
+        for d in &self.decls {
+            if matches!(
+                d.kind,
+                DeclKind::Field | DeclKind::Method | DeclKind::Property | DeclKind::EnumMember
+            ) {
+                if let Some(Some(owner)) = self.type_of_scope.get(d.scope) {
+                    members
+                        .entry(owner.clone())
+                        .or_default()
+                        .insert(d.name.clone());
+                }
+            }
+        }
         Resolved {
             decls: self.decls,
             root_refs,
             member_refs,
             type_of_scope: self.type_of_scope,
+            parents: self.parents,
+            members,
         }
     }
 }
@@ -464,6 +543,87 @@ mod tests {
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), total, "spans must be unique");
+    }
+
+    #[test]
+    fn generic_argument_is_not_treated_as_a_base() {
+        // `class C : Dictionary<string, List>` does not make C inherit List, so
+        // a List member is not reached through C.
+        let src = "class List { public int Count; }\nclass C : Dictionary<string, List> { public void U() { this.Count = 1; } }";
+        let r = resolve_src(src);
+        let count = *r.find("Count", Some(DeclKind::Field)).first().unwrap();
+        assert_eq!(
+            r.references_of(count).len(),
+            1,
+            "List.Count should be its declaration only, not bound through C"
+        );
+
+        // A real generic base still inherits: Base<int> contributes Base.
+        let inherit =
+            "class Base { public int X; }\nclass B : Base<int> { public void U() { this.X = 1; } }";
+        let r = resolve_src(inherit);
+        let x = *r.find("X", Some(DeclKind::Field)).first().unwrap();
+        assert_eq!(r.references_of(x).len(), 2, "generic base still inherits");
+    }
+
+    #[test]
+    fn inherited_members_bind_through_this_and_base() {
+        // base.X and an inherited this.X bind to the base type's member, so a
+        // rename of the base member reaches every inherited use.
+        let src = "class A {\n public int Count;\n public void M() { }\n}\nclass B : A {\n public void Use() {\n  this.Count = 1;\n  base.Count = 2;\n  base.M();\n }\n}";
+        let r = resolve_src(src);
+        let count = *r.find("Count", Some(DeclKind::Field)).first().unwrap();
+        assert_eq!(r.references_of(count).len(), 3, "decl + this + base");
+        let m = *r.find("M", Some(DeclKind::Method)).first().unwrap();
+        assert_eq!(r.references_of(m).len(), 2, "decl + base.M");
+    }
+
+    #[test]
+    fn shadowed_member_binds_to_most_derived() {
+        // B redeclares Count. `this.Count` in B binds to B's, `base.Count`
+        // binds to A's.
+        let via_this =
+            "class A { public int Count; }\nclass B : A { public int Count; public void U() { this.Count = 1; } }";
+        let r = resolve_src(via_this);
+        let ids = r.find("Count", Some(DeclKind::Field));
+        assert_eq!(ids.len(), 2);
+        for id in ids {
+            let refs = r.references_of(id);
+            // A.Count is declared earlier in the source than B.Count.
+            if refs[0].start < 25 {
+                assert_eq!(refs.len(), 1, "A.Count: declaration only");
+            } else {
+                assert_eq!(refs.len(), 2, "B.Count: declaration + this.Count");
+            }
+        }
+
+        let via_base =
+            "class A { public int Count; }\nclass B : A { public int Count; public void U() { base.Count = 1; } }";
+        let r = resolve_src(via_base);
+        for id in r.find("Count", Some(DeclKind::Field)) {
+            let refs = r.references_of(id);
+            if refs[0].start < 25 {
+                assert_eq!(refs.len(), 2, "A.Count: declaration + base.Count");
+            } else {
+                assert_eq!(refs.len(), 1, "B.Count: declaration only");
+            }
+        }
+    }
+
+    #[test]
+    fn external_and_cyclic_bases_are_safe() {
+        // A base type not present in the unit ends the chain (no false bind),
+        // and a cyclic base list does not loop.
+        let external = "class B : ExternalThing { public void U() { base.DoIt(); } }";
+        let r = resolve_src(external);
+        assert!(r.find("DoIt", Some(DeclKind::Method)).is_empty());
+
+        let cyclic =
+            "class A : B { public int X; }\nclass B : A { public void U() { this.X = 1; } }";
+        let r = resolve_src(cyclic);
+        // Must terminate; X resolves to the single declaration plus the this use.
+        let x = *r.find("X", Some(DeclKind::Field)).first().unwrap();
+        assert!(!r.references_of(x).is_empty());
     }
 
     #[test]

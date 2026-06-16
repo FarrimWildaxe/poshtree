@@ -49,6 +49,10 @@ pub enum CsNodeKind {
         kind: CsTypeKind,
         /// The declared type name.
         name: CsName,
+        /// Base type and interface names from the `: A, IFoo` list, first
+        /// identifier of each entry (generics and namespaces dropped). Empty
+        /// when the type has no base list.
+        bases: Vec<CsName>,
     },
     /// A method declaration. A scope; parameters and body are children.
     Method(CsName),

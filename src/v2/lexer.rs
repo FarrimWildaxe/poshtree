@@ -769,6 +769,10 @@ impl<'a> Lexer<'a> {
             self.bump();
             self.bump();
             let digits_start = self.pos;
+            // Stops at the first non-binary digit, leaving the remainder to
+            // re-lex (so `0b1012` is `0b101` then `2`). PowerShell rejects such
+            // a literal anyway; splitting it keeps the lexer lenient rather
+            // than emitting a combined malformed-number token.
             while matches!(self.peek(), Some('0' | '1')) {
                 self.bump();
             }

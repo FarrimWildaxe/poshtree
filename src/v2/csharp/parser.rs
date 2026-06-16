@@ -245,7 +245,57 @@ impl CsParser {
             span: self.span(),
         });
         self.skip_generic_params();
-        // Base list / constraints: skip to the body.
+        // Base list: `: A, IFoo<T>, N.Base`. Capture the first identifier of
+        // each comma-separated entry (the simple type name), then skip to the
+        // body, stepping over generics, namespaces, and any `where` clause.
+        let mut bases = Vec::new();
+        if self.eat(K::Colon) {
+            let mut expect_name = true;
+            while !self.at(K::Eof) && !self.at(K::LBrace) && !self.at(K::Semicolon) {
+                if self.at(K::Ident) && self.tok().text == "where" {
+                    break; // constraint clause, not a base
+                }
+                if self.at(K::Comma) {
+                    expect_name = true;
+                    self.advance();
+                    continue;
+                }
+                // A generic argument list belongs to the entry just named, not
+                // the base list; consume the balanced `<...>` so a comma inside
+                // it is not read as a base separator (`Dictionary<string,
+                // List<int>>` has one base). The captured inner identifiers are
+                // discarded here: base-list generics are not rename targets.
+                if !expect_name && self.at(K::Lt) {
+                    let mut sink = Vec::new();
+                    self.consume_generic_args(&mut sink);
+                    continue;
+                }
+                if expect_name && self.at(K::Ident) {
+                    // The simple name is the last segment of a `.`/`::`-qualified
+                    // entry, so a namespace or alias qualifier is dropped
+                    // (`global::N.Base` keeps `Base`).
+                    let mut name = CsName {
+                        text: self.tok().text.clone(),
+                        span: self.span(),
+                    };
+                    self.advance();
+                    while self.eat(K::Dot) || self.eat(K::ColonColon) {
+                        if self.at(K::Ident) {
+                            name = CsName {
+                                text: self.tok().text.clone(),
+                                span: self.span(),
+                            };
+                            self.advance();
+                        }
+                    }
+                    bases.push(name);
+                    expect_name = false;
+                    continue;
+                }
+                self.advance();
+            }
+        }
+        // Any remaining constraint text before the body.
         while !self.at(K::Eof) && !self.at(K::LBrace) && !self.at(K::Semicolon) {
             self.advance();
         }
@@ -261,7 +311,7 @@ impl CsParser {
             self.eat(K::Semicolon);
         }
         CsNode::new(
-            CsNodeKind::Type { kind, name },
+            CsNodeKind::Type { kind, name, bases },
             Span::new(start, self.last_end()),
             children,
         )

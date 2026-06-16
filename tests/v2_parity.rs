@@ -156,7 +156,7 @@ fn kids_v2(n: &Node) -> Vec<String> {
             k.extend(block(stmts_of(body)));
             k
         }
-        Switch { input, cases } => {
+        Switch { input, cases, .. } => {
             let mut k = vec![skel_v2(input)];
             for c in cases {
                 k.extend(block(stmts_of(c)));
@@ -233,10 +233,21 @@ fn kids_v2(n: &Node) -> Vec<String> {
         Using { .. } | Variable(_) | Number(_) | TypeExpression(_) | BareWord(_) | Error(_) => {
             Vec::new()
         }
+        // NodeKind is non-exhaustive; any variant without its own skeleton
+        // contributes no children here.
+        _ => Vec::new(),
     }
 }
 
 fn skel_v2(n: &Node) -> String {
+    use NodeKind::*;
+    // The v1 parser does not model parameter metadata; it emits a bare
+    // variable for each parameter slot. Render a v2 Parameter the same way so
+    // the shared structure still compares equal (the attributes and default
+    // are a v2-only enrichment, checked by their own tests).
+    if matches!(n.kind, Parameter { .. }) {
+        return "Variable".to_string();
+    }
     let k = kids_v2(n);
     if k.is_empty() {
         n.label().to_string()

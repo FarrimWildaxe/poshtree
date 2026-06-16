@@ -86,15 +86,8 @@ pub fn rename_member(
 fn ps_type_refs(scope: &Node, src: &str, from: &str, out: &mut Vec<Span>) {
     scope.walk(&mut |n| match &n.kind {
         // Inside the brackets: `[ ... ]`.
-        NodeKind::TypeExpression(_) if n.span.end > n.span.start + 1 => {
-            let inner_start = n.span.start + 1;
-            let inner_end = n.span.end - 1;
-            find_type_name_spans(
-                safe_inner(src, inner_start, inner_end),
-                inner_start,
-                from,
-                out,
-            );
+        NodeKind::TypeExpression(_) => {
+            find_in_interior(src, n.span, from, out);
         }
         NodeKind::Cast { .. } => {
             // The type literal at the start: `[ ... ]$operand`. Scan to the
@@ -102,51 +95,54 @@ fn ps_type_refs(scope: &Node, src: &str, from: &str, out: &mut Vec<Span>) {
             // cut the type short (`[List[Logger]]`).
             let rest = &src[n.span.start..n.span.end];
             if let Some(close) = matching_bracket(rest) {
-                let inner_start = n.span.start + 1;
-                let inner_end = n.span.start + close;
-                if inner_end > inner_start {
-                    find_type_name_spans(
-                        safe_inner(src, inner_start, inner_end),
-                        inner_start,
-                        from,
-                        out,
-                    );
-                }
+                find_in_byte_range(src, n.span.start + 1, n.span.start + close, from, out);
             }
         }
         NodeKind::Command { name, elements, .. } => {
             let cmd = match &name.kind {
-                NodeKind::BareWord(w) => w.to_ascii_lowercase(),
-                _ => String::new(),
+                NodeKind::BareWord(w) => w.as_str(),
+                _ => "",
             };
-            match cmd.as_str() {
+            // Compared case-insensitively without allocating, since every
+            // command in the script reaches here but only these two matter.
+            if cmd.eq_ignore_ascii_case("new-object") {
                 // `New-Object Logger` / `-TypeName 'Logger'`: the argument is
                 // the type name.
-                "new-object" => {
-                    if let Some(node) = new_object_type_arg(elements) {
-                        push_type_name_from_arg(src, node, from, out);
-                    }
+                if let Some(node) = new_object_type_arg(elements) {
+                    push_type_name_from_arg(src, node, from, out);
                 }
+            } else if cmd.eq_ignore_ascii_case("add-type") {
                 // `Add-Type ... -Name Win32`: for a member-definition the
                 // generated type's declaration site is the `-Name` argument.
-                "add-type" => {
-                    if let Some(node) = named_parameter_value(elements, "name") {
-                        push_type_name_from_arg(src, node, from, out);
-                    }
+                if let Some(node) = named_parameter_value(elements, "name") {
+                    push_type_name_from_arg(src, node, from, out);
                 }
-                _ => {}
             }
         }
-        // A PowerShell-native type declaration: `class Logger : Base { ... }`
-        // or `enum E { ... }`. The node stores the name string but not its
-        // span, so scan the header (everything before the body `{`) for the
-        // declared name and for any base type after `:`. Both are renameable;
-        // member-signature types are not, since the parser drops parameter and
-        // property type annotations (tracked separately).
-        NodeKind::ClassDefinition { .. } | NodeKind::EnumDefinition { .. } => {
-            let header_end = type_header_end(src, n.span);
-            let header = &src[n.span.start..header_end];
-            find_type_name_spans_in_header(header, n.span.start, from, out);
+        // A PowerShell-native type declaration. The name is renamed from its
+        // stored span; base types (after the name, before `{`) are matched by
+        // a comment-aware scan, since `bases` are kept as plain strings.
+        NodeKind::ClassDefinition {
+            name, name_span, ..
+        } => {
+            if name.eq_ignore_ascii_case(from) {
+                out.push(*name_span);
+            }
+            let base_start = name_span.end;
+            let base_end = type_header_end(src, n.span).max(base_start);
+            find_type_name_spans_in_header(
+                safe_inner(src, base_start, base_end),
+                base_start,
+                from,
+                out,
+            );
+        }
+        NodeKind::EnumDefinition {
+            name, name_span, ..
+        } if name.eq_ignore_ascii_case(from) => {
+            // An enum's only header type name is its own; the backing type
+            // after `:` is a primitive, not a renamable user type.
+            out.push(*name_span);
         }
         _ => {}
     });
@@ -173,6 +169,12 @@ fn type_header_end(src: &str, node: Span) -> usize {
 /// every match is either the declared name or a base type, both of which a
 /// type rename should rewrite.
 fn find_type_name_spans_in_header(text: &str, base: usize, from: &str, out: &mut Vec<Span>) {
+    // Common case: a header with no comment needs no masking, so scan directly
+    // and skip building a copy.
+    if !text.as_bytes().contains(&b'#') {
+        find_type_name_spans(text, base, from, out);
+        return;
+    }
     // Build a copy with comment bytes blanked to spaces, preserving offsets and
     // UTF-8 validity (ASCII space is one byte, replacing whole comment runs).
     let mut masked = String::with_capacity(text.len());
@@ -207,6 +209,39 @@ fn find_type_name_spans_in_header(text: &str, base: usize, from: &str, out: &mut
         }
     }
     find_type_name_spans(&masked, base, from, out);
+}
+
+/// Runs `find_type_name_spans` over `src[start..end]` after snapping both ends
+/// to char boundaries, with results offset back to the original source. The
+/// single place that turns a byte range into type-name matches.
+fn find_in_byte_range(src: &str, start: usize, end: usize, from: &str, out: &mut Vec<Span>) {
+    if end <= start {
+        return;
+    }
+    find_type_name_spans(safe_inner(src, start, end), start, from, out);
+}
+
+/// Matches `from` inside a node's delimited interior: one delimiter character
+/// on each side (`[...]`, `'...'`, `"..."`). A node too short to have an
+/// interior contributes nothing.
+fn find_in_interior(src: &str, span: Span, from: &str, out: &mut Vec<Span>) {
+    if span.end <= span.start + 1 {
+        return;
+    }
+    find_in_byte_range(src, span.start + 1, span.end - 1, from, out);
+}
+
+/// Whether a node is a plain single/double-quoted string literal (no
+/// interpolation) long enough to have an interior. The shape `New-Object` and
+/// `Add-Type -Name` accept for a quoted type name.
+fn is_plain_quoted(node: &Node) -> bool {
+    matches!(
+        &node.kind,
+        NodeKind::StringLiteral { kind, parts, .. }
+            if parts.is_empty()
+                && matches!(kind, StringKind::Single | StringKind::Double)
+                && node.span.end >= node.span.start + 2
+    )
 }
 
 /// Slices `src[start..end]`, snapping both ends inward to the nearest UTF-8
@@ -333,20 +368,8 @@ fn push_type_name_from_arg(src: &str, node: &Node, from: &str, out: &mut Vec<Spa
                 out.push(node.span);
             }
         }
-        NodeKind::StringLiteral { kind, parts, .. }
-            if parts.is_empty()
-                && matches!(kind, StringKind::Single | StringKind::Double)
-                && node.span.end >= node.span.start + 2 =>
-        {
-            let inner_start = node.span.start + 1;
-            let inner_end = node.span.end - 1;
-            find_type_name_spans(
-                safe_inner(src, inner_start, inner_end),
-                inner_start,
-                from,
-                out,
-            );
-        }
+        // A quoted type name: match inside the quotes so they survive.
+        _ if is_plain_quoted(node) => find_in_interior(src, node.span, from, out),
         _ => {}
     }
 }
@@ -356,7 +379,7 @@ fn new_object_type_arg(elements: &[Node]) -> Option<&Node> {
     while i < elements.len() {
         match &elements[i].kind {
             NodeKind::CommandParameter { name, argument }
-                if "typename".starts_with(&name.to_ascii_lowercase()) =>
+                if is_prefix_ignore_ascii_case(name, "typename") =>
             {
                 if let Some(arg) = argument {
                     return Some(arg);
@@ -373,6 +396,14 @@ fn new_object_type_arg(elements: &[Node]) -> Option<&Node> {
         i += 1;
     }
     None
+}
+
+/// Whether `prefix` is a non-empty case-insensitive prefix of `full`, without
+/// allocating. Lets an abbreviated parameter (`-Type`) match `-TypeName`.
+fn is_prefix_ignore_ascii_case(prefix: &str, full: &str) -> bool {
+    !prefix.is_empty()
+        && prefix.len() <= full.len()
+        && full.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
 /// Whether a bracketed type text names `target` (whole, or by last segment),
@@ -484,11 +515,7 @@ fn each_csharp_unit(
 fn arg_name_text(node: &Node, src: &str) -> Option<String> {
     match &node.kind {
         NodeKind::BareWord(w) => Some(w.clone()),
-        NodeKind::StringLiteral { kind, parts, .. }
-            if parts.is_empty()
-                && matches!(kind, StringKind::Single | StringKind::Double)
-                && node.span.end >= node.span.start + 2 =>
-        {
+        _ if is_plain_quoted(node) => {
             Some(safe_inner(src, node.span.start + 1, node.span.end - 1).to_string())
         }
         _ => None,
@@ -602,6 +629,37 @@ mod tests {
         let o2 = parse(other);
         let r2 = apply_edits(other, &rename_type(&o2.script, other, "Win32", "WinApi")).unwrap();
         assert!(r2.contains("Get-Process -Name Win32"));
+    }
+
+    #[test]
+    fn class_and_enum_name_span_is_populated() {
+        // The durable X4 path renames from the stored name_span; confirm the
+        // span actually points at the name text.
+        let out = parse("class Logger { }\nenum Color { Red }\n");
+        let mut found = Vec::new();
+        out.script.walk(&mut |n| match &n.kind {
+            NodeKind::ClassDefinition {
+                name, name_span, ..
+            }
+            | NodeKind::EnumDefinition {
+                name, name_span, ..
+            } => {
+                found.push((
+                    name.clone(),
+                    name_span
+                        .slice("class Logger { }\nenum Color { Red }\n")
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        });
+        assert_eq!(
+            found,
+            vec![
+                ("Logger".into(), "Logger".into()),
+                ("Color".into(), "Color".into())
+            ]
+        );
     }
 
     #[test]
