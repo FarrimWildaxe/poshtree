@@ -181,6 +181,34 @@ impl Resolved {
                 }
             }
         }
+        if decl.kind == DeclKind::Type {
+            // A constructor's name is the type name, and `new T(...)` names the
+            // type too. Both are collected against the constructor declaration
+            // (its name matches the type and it is a member kind), so fold in
+            // every constructor owned by this type. This is what makes a type
+            // rename reach `public T()` and `new T()`.
+            for (id, other) in self.decls.iter().enumerate() {
+                if other.kind == DeclKind::Ctor
+                    && self
+                        .type_of_scope
+                        .get(other.scope)
+                        .and_then(|t| t.as_deref())
+                        == Some(decl.name.as_str())
+                {
+                    spans.push(other.span);
+                    if let Some(refs) = self.root_refs.get(id) {
+                        spans.extend(refs.iter().copied());
+                    }
+                    for m in &self.member_refs {
+                        if m.text == other.name
+                            && self.receiver_is_this_member(m, Some(decl.name.as_str()))
+                        {
+                            spans.push(m.span);
+                        }
+                    }
+                }
+            }
+        }
         spans.sort_by_key(|s| (s.start, s.end));
         spans.dedup();
         spans
@@ -419,6 +447,23 @@ mod tests {
         let refs = ref_texts(src, "a", DeclKind::Param);
         // declaration + two uses of `a`
         assert_eq!(refs.len(), 3);
+    }
+
+    #[test]
+    fn type_references_include_constructors_and_new() {
+        // X1 at the resolver level: a type collects its declaration, every
+        // constructor name, and every `new T(...)` site.
+        let src = "class Logger {\n public Logger() { }\n public Logger(int n) { }\n void M() { var a = new Logger(); var b = new Logger(5); }\n}";
+        let r = resolve_src(src);
+        let id = *r.find("Logger", Some(DeclKind::Type)).first().unwrap();
+        let refs = r.references_of(id);
+        assert_eq!(refs.len(), 5, "decl + 2 ctors + 2 new: {refs:?}");
+        // No duplicate spans.
+        let mut keys: Vec<_> = refs.iter().map(|s| (s.start, s.end)).collect();
+        let total = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), total, "spans must be unique");
     }
 
     #[test]
