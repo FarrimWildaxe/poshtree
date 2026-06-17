@@ -19,6 +19,19 @@
 //! compiling. Turn features off to compile just one front-end
 //! (`default-features = false, features = ["v1"]`).
 //!
+//! # PowerShell conformance
+//!
+//! The `v2` parser follows PowerShell's documented operator precedence
+//! (`about_Operator_Precedence`), including the comma operator, which binds
+//! tighter than `-f`, arithmetic, comparison, and logical operators and looser
+//! only than casts, index, member access, subexpressions, and the unary
+//! operators. So `1,2,1+2` parses as `(1,2,1)+2` (the array `1,2,1` with `2`
+//! appended), as in PowerShell, and a comma-separated argument to a format
+//! string (`"{0} {1}" -f $a, $b`) is grouped into one array before `-f` is
+//! applied. An array used as a parameter default must be parenthesized
+//! (`param($x = (1, 2))`) or use `@(...)`, since a bare top-level comma in a
+//! parameter list separates parameters.
+//!
 //! # Quick start
 //!
 #![cfg_attr(feature = "v2", doc = " ```")]

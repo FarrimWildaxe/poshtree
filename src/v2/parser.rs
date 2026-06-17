@@ -96,6 +96,7 @@ pub fn parse_tokens(src: &str, tokens: Vec<Token>) -> ParseOutput {
         errors: Vec::new(),
         depth: 0,
         in_command_argument: false,
+        suppress_array_comma: false,
         overflowed: false,
         vars: std::collections::HashMap::new(),
     };
@@ -131,6 +132,12 @@ struct Parser<'a> {
     /// (parens, script blocks, statements) clear it, since they re-enter pure
     /// expression context.
     in_command_argument: bool,
+    /// When set, `parse_array_literal` does not collect a trailing comma into an
+    /// array, so the comma stays available as a separator. Used for parameter
+    /// defaults, where a top-level comma separates parameters rather than
+    /// building an array. Reset inside any grouping (parens, `@()`, `@{}`,
+    /// index) so commas there still build arrays.
+    suppress_array_comma: bool,
     /// Set once the depth limit is hit. While set, the recursive entry points
     /// stop descending and drain one token at a time, so recovery from
     /// pathological nesting stays linear in the token count instead of letting
@@ -383,8 +390,11 @@ impl Parser<'_> {
         }
         let saved = self.in_command_argument;
         self.in_command_argument = false;
+        let saved_comma = self.suppress_array_comma;
+        self.suppress_array_comma = false;
         let node = self.parse_statement_inner();
         self.in_command_argument = saved;
+        self.suppress_array_comma = saved_comma;
         self.leave();
         node
     }
@@ -1387,12 +1397,18 @@ impl Parser<'_> {
         let name = self.value().to_string();
         let name_span = self.tokens[self.pos].span;
         self.bump();
-        // Optional default: `= <expression>`. Use the ternary level, not the
-        // full expression, so a top-level comma separates parameters rather
-        // than being read as an array element of this default.
+        // Optional default: `= <expression>`. The comma is suppressed at the
+        // top of the default so a top-level comma separates parameters rather
+        // than being read as an array element of this default (an array default
+        // must be parenthesized, `$x = (1, 2)`, or use `@(...)`). The comma
+        // collection resumes inside any grouping.
         let default = if self.at_op("=") {
             self.bump();
-            Some(Box::new(self.parse_ternary()))
+            let saved = self.suppress_array_comma;
+            self.suppress_array_comma = true;
+            let expr = self.parse_ternary();
+            self.suppress_array_comma = saved;
+            Some(Box::new(expr))
         } else {
             None
         };
@@ -1410,17 +1426,17 @@ impl Parser<'_> {
 
     // Expressions
 
+    /// Parses an expression. The comma operator is no longer handled here; it
+    /// sits lower, at `parse_array_literal`, between the binary-operator climb
+    /// and `parse_unary`, so it binds tighter than `-f`, the arithmetic,
+    /// comparison, and logical operators (looser only than casts, index, member
+    /// access, subexpressions, and the unary operators). This matches
+    /// PowerShell's documented precedence (`about_Operator_Precedence`), where
+    /// the comma operator is among the highest. For example, `1,2,1+2` parses
+    /// as `(1,2,1)+2` (the array `1,2,1` with `2` appended), as in PowerShell,
+    /// not as `@(1,2,3)`.
     fn parse_expression(&mut self) -> Node {
-        let start = self.pos;
-        let first = self.parse_ternary();
-        if self.at(T::Comma) {
-            self.bump();
-            // Right-associative: `a, b, c` nests as ArrayLiteral[a, [b, c]],
-            // matching v1's comma operator.
-            let rest = self.parse_expression();
-            return self.make(NodeKind::ArrayLiteral(vec![first, rest]), start, self.pos);
-        }
-        first
+        self.parse_ternary()
     }
 
     fn parse_ternary(&mut self) -> Node {
@@ -1450,7 +1466,7 @@ impl Parser<'_> {
 
     fn parse_binary(&mut self, min_prec: u8) -> Node {
         let start = self.pos;
-        let mut left = self.parse_unary();
+        let mut left = self.parse_array_literal();
         loop {
             if let Some(prec) = self.binary_prec() {
                 if prec < min_prec {
@@ -1565,21 +1581,58 @@ impl Parser<'_> {
         let v = tok.value.as_str();
         if eq("??") {
             Some(1)
-        } else if eq("-or") || eq("-xor") {
+        } else if eq("-or") || eq("-xor") || eq("-and") {
+            // PowerShell gives `-and`, `-or`, and `-xor` equal precedence; they
+            // fold left to right. (Microsoft about_Operator_Precedence: the
+            // documented example `$true -or $false -and $false` is FALSE.)
             Some(2)
-        } else if eq("-and") {
-            Some(3)
         } else if eq("..") {
+            // Range binds tighter than `-f` (the table puts `..` above `-f`),
+            // so it sits one rank above the format operator below.
+            Some(9)
+        } else if is_format_op(v) {
+            // `-f` binds tighter than the arithmetic operators and looser than
+            // range (about_Operator_Precedence ranks it above `* / %` and
+            // `+ -`). Its own rank, not the comparison tier it would otherwise
+            // fall into via `is_comparison_op`. Comma binds tighter than `-f`,
+            // so the right operand picks up a whole comma list through
+            // `parse_array_literal` without a special case.
             Some(8)
         } else if eq("+") || eq("-") {
             Some(6)
         } else if eq("*") || eq("/") || eq("%") {
             Some(7)
-        } else if is_comparison_op(v) || is_bitwise_op(v) {
+        } else if is_comparison_op(v) {
+            // Comparison operators (and the type and binary split/join
+            // operators, all one equal tier) bind tighter than the bitwise
+            // tier below them.
             Some(5)
+        } else if is_bitwise_op(v) {
+            // Bitwise and shift operators are a tier looser than comparison and
+            // tighter than the logical operators (about_Operator_Precedence).
+            Some(4)
         } else {
             None
         }
+    }
+
+    /// The array-literal level: `unary-expression (, unary-expression)*`. Sits
+    /// between the binary-operator climb and `parse_unary`, so the comma binds
+    /// tighter than every binary operator (`-f`, arithmetic, comparison,
+    /// bitwise, logical, range) and looser than the unary operators, casts,
+    /// index, and member access, matching PowerShell's precedence. A single
+    /// element with no trailing comma is returned unwrapped. The array nests to
+    /// the right (`a, b, c` is `ArrayLiteral[a, ArrayLiteral[b, c]]`), the shape
+    /// the comma operator produced when it was handled at the top level.
+    fn parse_array_literal(&mut self) -> Node {
+        let start = self.pos;
+        let first = self.parse_unary();
+        if self.at(T::Comma) && !self.suppress_array_comma {
+            self.bump();
+            let rest = self.parse_array_literal();
+            return self.make(NodeKind::ArrayLiteral(vec![first, rest]), start, self.pos);
+        }
+        first
     }
 
     fn parse_unary(&mut self) -> Node {
@@ -1724,9 +1777,12 @@ impl Parser<'_> {
     /// again (`dir ($_*2)`).
     fn in_expression_context<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let saved = self.in_command_argument;
+        let saved_comma = self.suppress_array_comma;
         self.in_command_argument = false;
+        self.suppress_array_comma = false;
         let r = f(self);
         self.in_command_argument = saved;
+        self.suppress_array_comma = saved_comma;
         r
     }
 
@@ -1888,6 +1944,12 @@ fn is_assignment_op(op: &str) -> bool {
     matches!(op, "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "??=")
 }
 
+/// PowerShell's only format operator, `-f`. Case-insensitive, optional leading
+/// `-`, matching how the other operator predicates compare.
+fn is_format_op(op: &str) -> bool {
+    op.strip_prefix('-').unwrap_or(op).eq_ignore_ascii_case("f")
+}
+
 fn is_comparison_op(v: &str) -> bool {
     // Operators are case-insensitive in PowerShell (`-EQ`, `-iLike`). Strip a
     // leading `-`, then match the name. The optional case-sensitivity prefix
@@ -1912,12 +1974,10 @@ fn is_comparison_op(v: &str) -> bool {
         "notin",
         "is",
         "isnot",
+        "as",
         "replace",
         "split",
         "join",
-        "f",
-        "shl",
-        "shr",
     ];
     let matches_name = |s: &str| NAMES.iter().any(|n| n.eq_ignore_ascii_case(s));
     if matches_name(core) {
@@ -1931,12 +1991,12 @@ fn is_comparison_op(v: &str) -> bool {
     }
 }
 
-/// The binary bitwise operators. In PowerShell these share one precedence tier
-/// with the comparison operators (`-shl` and `-shr` are already covered by
-/// [`is_comparison_op`]), evaluated left to right.
+/// The binary bitwise and shift operators (`-band`, `-bor`, `-bxor`, `-shl`,
+/// `-shr`). They form one precedence tier, looser than the comparison operators
+/// and tighter than the logical operators, evaluated left to right.
 fn is_bitwise_op(v: &str) -> bool {
     let core = v.strip_prefix('-').unwrap_or(v);
-    ["band", "bor", "bxor"]
+    ["band", "bor", "bxor", "shl", "shr"]
         .iter()
         .any(|n| n.eq_ignore_ascii_case(core))
 }
@@ -3111,10 +3171,11 @@ mod tests {
     }
 
     #[test]
-    fn bitwise_and_comparison_share_one_precedence_tier() {
-        // PowerShell evaluates the comparison and bitwise operators in one
-        // left-associative tier, so these chain left to right.
-        assert_eq!(expr_shape("1 -bor 2 -eq 3"), "((1 -bor 2) -eq 3)");
+    fn comparison_is_tighter_than_bitwise_tier() {
+        // PowerShell ranks the comparison tier above the bitwise tier, so a
+        // comparison mixed with a bitwise or shift operator binds first.
+        assert_eq!(expr_shape("1 -bor 2 -eq 3"), "(1 -bor (2 -eq 3))");
+        // Bitwise and shift operators share one tier, left-associative.
         assert_eq!(expr_shape("5 -band 6 -shl 1"), "((5 -band 6) -shl 1)");
         assert_eq!(expr_shape("1 -bxor 2 -bor 3"), "((1 -bxor 2) -bor 3)");
     }
@@ -3347,6 +3408,269 @@ mod tests {
             vec![(1, true, "$x".into()), (1, true, "$y".into())]
         );
         assert_eq!(params("param($plain)\n"), vec![(0, false, "$plain".into())]);
+    }
+
+    #[test]
+    fn as_type_operator_is_recognized() {
+        // `-as` is a binary type operator (about_Type_Operators); `$x -as [int]`
+        // is a single conversion, not two statements.
+        fn shape(src: &str) -> String {
+            let out = parse(src);
+            match out.script.kind {
+                NodeKind::Script(ref v) if v.len() == 1 => match &v[0].kind {
+                    NodeKind::Binary { op, right, .. } => {
+                        format!("Binary({op}, {})", right.label())
+                    }
+                    other => format!("{:?}", std::mem::discriminant(other)),
+                },
+                NodeKind::Script(ref v) => format!("{} statements", v.len()),
+                _ => "not-script".into(),
+            }
+        }
+        assert_eq!(shape("$x -as [int]\n"), "Binary(-as, TypeExpression)");
+        assert_eq!(shape("$x -is [int]\n"), "Binary(-is, TypeExpression)");
+        // `-as` followed by a comparison binds left: `($x -as [int]) -eq 1`.
+        let out = parse("$x -as [int] -eq 1\n");
+        if let NodeKind::Script(v) = &out.script.kind {
+            assert_eq!(v.len(), 1, "should be a single expression, not split");
+        }
+        for src in ["$x -as [int]\n", "$x -as [int] -eq 1\n"] {
+            assert_eq!(crate::v2::reconstruct(&lex(src).tokens), src);
+        }
+    }
+
+    #[test]
+    fn comparison_binds_tighter_than_bitwise() {
+        // about_Operator_Precedence puts the comparison tier above the bitwise
+        // tier (which includes the shifts), so `1 -band 2 -eq 3` is
+        // `1 -band (2 -eq 3)`, not `(1 -band 2) -eq 3`.
+        fn outer(src: &str) -> String {
+            let out = parse(src);
+            match out.script.kind {
+                NodeKind::Script(ref v) => match v.first().map(|n| &n.kind) {
+                    Some(NodeKind::Binary { op, right, .. }) => {
+                        format!("Binary({op}, right={})", right.label())
+                    }
+                    _ => "other".into(),
+                },
+                _ => "not-script".into(),
+            }
+        }
+        // Comparison is the inner (tighter) node; bitwise/shift is outer.
+        assert_eq!(
+            outer("1 -band 2 -eq 3\n"),
+            "Binary(-band, right=BinaryExpression)"
+        );
+        assert_eq!(
+            outer("1 -shl 2 -eq 3\n"),
+            "Binary(-shl, right=BinaryExpression)"
+        );
+        // Bitwise group stays internally equal (left-associative).
+        assert_eq!(
+            outer("1 -band 2 -bor 3\n"),
+            "Binary(-bor, right=NumberLiteral)"
+        );
+        // Bitwise still binds tighter than logical.
+        assert_eq!(
+            outer("1 -band 2 -and 3\n"),
+            "Binary(-and, right=NumberLiteral)"
+        );
+        for src in [
+            "1 -band 2 -eq 3\n",
+            "1 -shl 2 -eq 3\n",
+            "1 -band 2 -bor 3\n",
+        ] {
+            assert_eq!(crate::v2::reconstruct(&lex(src).tokens), src);
+        }
+    }
+
+    #[test]
+    fn comma_binds_tighter_than_binary_operators() {
+        // PowerShell ranks the comma operator among the highest, above `-f`,
+        // arithmetic, comparison, and logical operators. The documented example
+        // is `1,2,1+2`, which PowerShell evaluates as `(1,2,1)+2` (printing
+        // `1 2 1 2`), not `@(1,2,3)`. So the comma array is the *left* operand
+        // of `+`, and `+` is the outermost node.
+        fn outer(src: &str) -> String {
+            let out = parse(src);
+            match out.script.kind {
+                NodeKind::Script(ref v) => match v.first().map(|n| &n.kind) {
+                    Some(NodeKind::Binary { op, left, .. }) => {
+                        format!("Binary({op}, left={})", left.label())
+                    }
+                    Some(other) => format!("{:?}", std::mem::discriminant(other)),
+                    None => "empty".into(),
+                },
+                _ => "not-script".into(),
+            }
+        }
+        // `+` is outermost; its left operand is the comma array.
+        assert_eq!(outer("1,2,1+2\n"), "Binary(+, left=ArrayLiteral)");
+        // `,1 + 2,3` is `(,1) + (2,3)`: `+` outermost, left is the one-element array.
+        assert_eq!(outer(",1 + 2,3\n"), "Binary(+, left=ArrayLiteral)");
+        // `1,2 -join 'x'` is `(1,2) -join 'x'`.
+        assert_eq!(outer("1,2 -join 'x'\n"), "Binary(-join, left=ArrayLiteral)");
+
+        // Inside an explicit group the comma builds the array as usual, and
+        // multiple assignment keeps a comma list on each side.
+        assert!(parse("$a, $b = 1, 2\n").errors.is_empty());
+
+        for src in [
+            "1,2,1+2\n",
+            ",1 + 2,3\n",
+            "1,2 -join 'x'\n",
+            "$a, $b = 1, 2\n",
+        ] {
+            assert_eq!(
+                crate::v2::reconstruct(&lex(src).tokens),
+                src,
+                "round-trip {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn logical_and_or_have_equal_precedence() {
+        // PowerShell gives `-and`, `-or`, `-xor` equal precedence, folding left
+        // to right, so `$true -or $false -and $false` is
+        // `($true -or $false) -and $false` (FALSE), not
+        // `$true -or ($false -and $false)` (TRUE).
+        fn outer_op(src: &str) -> Option<String> {
+            let out = parse(src);
+            if let NodeKind::Script(v) = &out.script.kind {
+                if let Some(NodeKind::Binary { op, .. }) = v.first().map(|n| &n.kind) {
+                    return Some(op.clone());
+                }
+            }
+            None
+        }
+        // Left-to-right means the *last* operator is the outermost node.
+        assert_eq!(
+            outer_op("$true -or $false -and $false\n").as_deref(),
+            Some("-and")
+        );
+        assert_eq!(outer_op("1 -and 2 -or 3\n").as_deref(), Some("-or"));
+        assert_eq!(outer_op("1 -xor 2 -and 3\n").as_deref(), Some("-and"));
+        // And `x -and y -or z` is unchanged (already left-associative).
+        assert_eq!(outer_op("1 -or 2 -and 3\n").as_deref(), Some("-and"));
+        for src in ["$true -or $false -and $false\n", "1 -and 2 -or 3\n"] {
+            assert_eq!(crate::v2::reconstruct(&lex(src).tokens), src);
+        }
+    }
+
+    #[test]
+    fn format_operator_binds_tighter_than_arithmetic() {
+        // about_Operator_Precedence ranks `-f` above `* / %` and `+ -`, so
+        // `"{0}" -f 1 + 2` is `("{0}" -f 1) + 2`, and range stays above `-f`.
+        fn outer_op(src: &str) -> Option<String> {
+            let out = parse(src);
+            if let NodeKind::Script(v) = &out.script.kind {
+                if let Some(NodeKind::Binary { op, .. }) = v.first().map(|n| &n.kind) {
+                    return Some(op.clone());
+                }
+            }
+            None
+        }
+        // `+` is the outermost node, so `-f` bound tighter.
+        assert_eq!(outer_op("\"{0}\" -f 1 + 2\n").as_deref(), Some("+"));
+        assert_eq!(outer_op("\"{0}\" -f 2 * 3\n").as_deref(), Some("*"));
+        // Range binds tighter than `-f`, so `-f` is the outermost node here.
+        assert_eq!(outer_op("\"{0}\" -f 1..3\n").as_deref(), Some("-f"));
+        // The `-f` comma argument list still works.
+        let out = parse("\"{0} {1}\" -f $a, $b\n");
+        let mut right_is_array = false;
+        out.script.walk(&mut |n| {
+            if let NodeKind::Binary { op, right, .. } = &n.kind {
+                if op == "-f" {
+                    right_is_array = matches!(right.kind, NodeKind::ArrayLiteral(_));
+                }
+            }
+        });
+        assert!(
+            right_is_array,
+            "-f right operand should be the argument array"
+        );
+        for src in [
+            "\"{0}\" -f 1 + 2\n",
+            "\"{0}\" -f 1..3\n",
+            "\"{0} {1}\" -f $a, $b\n",
+        ] {
+            assert_eq!(crate::v2::reconstruct(&lex(src).tokens), src);
+        }
+    }
+
+    #[test]
+    fn format_operator_binds_its_whole_argument_list() {
+        // `-f` formats against the entire right-hand comma list, so its right
+        // operand is an array of all arguments, and the top node is the binary
+        // `-f`, not an array wrapping it.
+        fn top_label(src: &str) -> &'static str {
+            let out = parse(src);
+            if let NodeKind::Script(v) = &out.script.kind {
+                if let Some(first) = v.first() {
+                    return first.label();
+                }
+            }
+            "Script"
+        }
+        fn format_right_is_array(src: &str) -> Option<usize> {
+            let out = parse(src);
+            let mut len = None;
+            out.script.walk(&mut |n| {
+                if let NodeKind::Binary { op, right, .. } = &n.kind {
+                    if op == "-f" {
+                        if let NodeKind::ArrayLiteral(_) = &right.kind {
+                            // Count leaf arguments by walking the right subtree.
+                            let mut n = 0;
+                            right.walk(&mut |x| {
+                                if matches!(x.kind, NodeKind::Variable(_) | NodeKind::Number(_)) {
+                                    n += 1;
+                                }
+                            });
+                            len = Some(n);
+                        }
+                    }
+                }
+            });
+            len
+        }
+
+        // Two arguments: top is the binary, right is an array of both.
+        assert_eq!(top_label("\"{0} {1}\" -f $a, $b\n"), "BinaryExpression");
+        assert_eq!(format_right_is_array("\"{0} {1}\" -f $a, $b\n"), Some(2));
+        // Three arguments.
+        assert_eq!(
+            format_right_is_array("\"{0} {1} {2}\" -f 1, 2, 3\n"),
+            Some(3)
+        );
+        // Single argument: the right operand is the value itself, not an array.
+        assert_eq!(top_label("\"{0}\" -f $a\n"), "BinaryExpression");
+        assert_eq!(format_right_is_array("\"{0}\" -f $a\n"), None);
+        // Assignment of a format result is an assignment, not an array assign.
+        assert_eq!(
+            top_label("$x = \"{0} {1}\" -f $a, $b\n"),
+            "AssignmentStatement"
+        );
+
+        // Comma binds tighter than the other operators now (PowerShell
+        // precedence), so the comma array is an operand of the binary, and the
+        // binary operator is the outermost node.
+        assert_eq!(top_label("$a + $b, $c\n"), "BinaryExpression");
+        assert_eq!(top_label("1 -eq 2, 3\n"), "BinaryExpression");
+
+        // The reshape is token-preserving.
+        for src in [
+            "\"{0} {1}\" -f $a, $b\n",
+            "\"{0}\" -f $a\n",
+            "$x = \"{0} {1}\" -f $a, $b\n",
+            "$a + $b, $c\n",
+        ] {
+            assert_eq!(
+                crate::v2::reconstruct(&lex(src).tokens),
+                src,
+                "round-trip {src:?}"
+            );
+        }
     }
 
     #[test]
