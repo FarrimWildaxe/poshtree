@@ -662,9 +662,12 @@ impl Parser<'_> {
         let start = self.pos;
         let name = strip_param_dash(self.value());
         self.bump();
-        // Bind a following argument as v1 does (`-Path value`); never bind to
-        // another parameter, and only when an argument actually starts.
-        let argument = if self.starts_argument() && !self.at(T::Parameter) {
+        // Bind a following argument as v1 does (`-Path value`): never bind to
+        // another parameter, only when an argument actually starts, and only on
+        // the same line. A newline ends the command (it is a command boundary),
+        // so a trailing switch like `-PassThru` followed by a newline takes no
+        // argument and does not swallow the next statement.
+        let argument = if self.starts_argument() && !self.at(T::Parameter) && !self.starts_line() {
             Some(Box::new(self.parse_command_argument()))
         } else {
             None
@@ -3408,6 +3411,53 @@ mod tests {
             vec![(1, true, "$x".into()), (1, true, "$y".into())]
         );
         assert_eq!(params("param($plain)\n"), vec![(0, false, "$plain".into())]);
+    }
+
+    #[test]
+    fn trailing_switch_parameter_does_not_swallow_next_statement() {
+        // A command parameter binds an argument only on the same line. A switch
+        // like `-PassThru` followed by a newline takes no argument, and the
+        // newline ends the command, so the next line is a separate statement.
+        fn count(src: &str) -> usize {
+            match parse(src).script.kind {
+                NodeKind::Script(v) => v.len(),
+                _ => 0,
+            }
+        }
+        assert_eq!(count("Get-Foo -PassThru\nGet-Bar\n"), 2);
+        assert_eq!(count("Get-Foo -PassThru\n$x = 1\n"), 2);
+        assert_eq!(count("Get-Foo -PassThru -Other\nGet-Bar\n"), 2);
+        assert_eq!(count("Get-Foo -PassThru\n\nGet-Bar\n"), 2);
+        // A parameter with a same-line argument still binds it (one command).
+        assert_eq!(count("Get-Foo -Name x\nGet-Bar\n"), 2);
+        assert_eq!(count("Get-Foo -Name x\n"), 1);
+
+        // The switch with a trailing newline has no bound argument; the
+        // same-line parameter does.
+        fn last_param_has_arg(src: &str) -> bool {
+            let out = parse(src);
+            let mut has = false;
+            out.script.walk(&mut |n| {
+                if let NodeKind::CommandParameter { argument, .. } = &n.kind {
+                    has = argument.is_some();
+                }
+            });
+            has
+        }
+        assert!(!last_param_has_arg("Get-Foo -PassThru\nGet-Bar\n"));
+        assert!(last_param_has_arg("Get-Foo -Name x\n"));
+
+        for src in [
+            "Get-Foo -PassThru\nGet-Bar\n",
+            "Get-Foo -PassThru -Other\nGet-Bar\n",
+            "Get-Foo -Name x\nGet-Bar\n",
+        ] {
+            assert_eq!(
+                crate::v2::reconstruct(&lex(src).tokens),
+                src,
+                "round-trip {src:?}"
+            );
+        }
     }
 
     #[test]
