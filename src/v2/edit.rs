@@ -35,10 +35,13 @@ impl TextEdit {
     }
 }
 
-/// Why a batch of edits was rejected. No partial output is ever produced:
-/// either every edit applies or none does.
+/// Why [`apply_edits`] rejected a batch of edits. No partial output is ever
+/// produced: either every edit applies or none does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditError {
+    /// An edit's span has a start offset greater than its end offset.
+    /// Rejected before bounds or UTF-8 boundary checks for that same edit.
+    InvalidRange(Span),
     /// Two edits cover overlapping byte ranges.
     Overlap { first: Span, second: Span },
     /// An edit reaches past the end of the source.
@@ -50,6 +53,12 @@ pub enum EditError {
 impl fmt::Display for EditError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            EditError::InvalidRange(span) => {
+                write!(
+                    f,
+                    "edit at {span} has a start offset greater than its end offset"
+                )
+            }
             EditError::Overlap { first, second } => {
                 write!(f, "overlapping edits at {first} and {second}")
             }
@@ -67,11 +76,24 @@ impl std::error::Error for EditError {}
 
 /// Applies `edits` to `src` and returns the rewritten text.
 ///
-/// Edits may be given in any order; they are sorted by start offset before
-/// application (the sort is stable, so two insertions at the same offset
-/// keep their given order). The batch is validated up front: out-of-bounds
-/// spans, boundaries inside a UTF-8 character, and overlapping ranges are
-/// all rejected. Touching spans (`a.end == b.start`) are fine.
+/// All spans address byte offsets in the original `src`. Edits may be given
+/// in any order; they are sorted by `(span.start, span.end)` before application.
+/// The sort is stable, so insertions at the same offset keep their given order.
+/// Touching spans (`a.end == b.start`) and insertions at either edge of a
+/// replacement are allowed; an insertion strictly inside a replacement overlaps
+/// it. Untouched bytes are preserved, and an empty batch returns `src` unchanged.
+///
+/// # Errors
+///
+/// The whole batch is validated before any output is produced. For each edit,
+/// a reversed span (`start > end`) returns [`EditError::InvalidRange`] before
+/// bounds or UTF-8 boundary checks for that same edit. Ordered spans must be
+/// within `src` and have both endpoints on UTF-8 character boundaries, or
+/// [`EditError::OutOfBounds`] or [`EditError::NotCharBoundary`] is returned.
+/// Overlapping ranges return [`EditError::Overlap`].
+///
+/// There is no guaranteed error priority across different invalid edits in a
+/// batch.
 pub fn apply_edits(src: &str, edits: &[TextEdit]) -> Result<String, EditError> {
     let mut order: Vec<usize> = (0..edits.len()).collect();
     // Sort by start, then by end. The secondary key matters when a zero-width
@@ -82,6 +104,9 @@ pub fn apply_edits(src: &str, edits: &[TextEdit]) -> Result<String, EditError> {
 
     for &i in &order {
         let span = edits[i].span;
+        if span.start > span.end {
+            return Err(EditError::InvalidRange(span));
+        }
         if span.end > src.len() {
             return Err(EditError::OutOfBounds(span));
         }
@@ -161,6 +186,128 @@ mod tests {
             apply_edits(src, &overlapping),
             Err(EditError::Overlap { .. })
         ));
+    }
+
+    #[test]
+    fn apply_edits_rejects_reversed_span_with_invalid_range() {
+        let span = Span { start: 4, end: 2 };
+        let edits = [TextEdit::delete(span)];
+
+        let result = apply_edits("abcdef", &edits);
+
+        assert_eq!(result, Err(EditError::InvalidRange(span)));
+    }
+
+    #[test]
+    fn apply_edits_rejects_reversed_span_with_only_start_out_of_bounds_as_invalid_range() {
+        let edits = [TextEdit::delete(Span { start: 7, end: 2 })];
+
+        let result = apply_edits("abcdef", &edits);
+
+        assert_eq!(
+            result,
+            Err(EditError::InvalidRange(Span { start: 7, end: 2 }))
+        );
+    }
+
+    #[test]
+    fn apply_edits_rejects_reversed_span_with_both_endpoints_out_of_bounds_as_invalid_range() {
+        let edits = [TextEdit::delete(Span { start: 9, end: 7 })];
+
+        let result = apply_edits("abcdef", &edits);
+
+        assert_eq!(
+            result,
+            Err(EditError::InvalidRange(Span { start: 9, end: 7 }))
+        );
+    }
+
+    #[test]
+    fn apply_edits_rejects_reversed_span_with_utf8_interior_endpoint_as_invalid_range() {
+        let edits = [TextEdit::delete(Span { start: 3, end: 2 })];
+
+        let result = apply_edits("ażb", &edits);
+
+        assert_eq!(
+            result,
+            Err(EditError::InvalidRange(Span { start: 3, end: 2 }))
+        );
+    }
+
+    #[test]
+    fn invalid_range_display_reports_original_span_and_reversal() {
+        let error = EditError::InvalidRange(Span { start: 4, end: 2 });
+
+        let message = error.to_string();
+
+        assert_eq!(
+            message,
+            "edit at 4..2 has a start offset greater than its end offset"
+        );
+    }
+
+    #[test]
+    fn apply_edits_rejects_utf8_interior_start_as_not_char_boundary() {
+        let edits = [TextEdit::delete(Span::new(2, 3))];
+
+        let result = apply_edits("ażb", &edits);
+
+        assert_eq!(result, Err(EditError::NotCharBoundary(2)));
+    }
+
+    #[test]
+    fn apply_edits_rejects_utf8_interior_end_as_not_char_boundary() {
+        let edits = [TextEdit::delete(Span::new(1, 2))];
+
+        let result = apply_edits("ażb", &edits);
+
+        assert_eq!(result, Err(EditError::NotCharBoundary(2)));
+    }
+
+    #[test]
+    fn apply_edits_replaces_unicode_at_valid_byte_boundaries() {
+        let edits = [TextEdit::replace(Span::new(1, 7), "界é")];
+
+        let result = apply_edits("aż🙂z", &edits);
+
+        assert_eq!(result, Ok("a界éz".to_owned()));
+    }
+
+    #[test]
+    fn apply_edits_preserves_given_order_of_same_offset_insertions() {
+        let edits = [
+            TextEdit::insert(2, "first"),
+            TextEdit::insert(0, "<"),
+            TextEdit::insert(2, "second"),
+        ];
+
+        let result = apply_edits("abcd", &edits);
+
+        assert_eq!(result, Ok("<abfirstsecondcd".to_owned()));
+    }
+
+    #[test]
+    fn apply_edits_accepts_right_edge_insertion_given_before_replacement() {
+        let edits = [
+            TextEdit::insert(4, "Y"),
+            TextEdit::replace(Span::new(1, 4), "X"),
+        ];
+
+        let result = apply_edits("abcdef", &edits);
+
+        assert_eq!(result, Ok("aXYef".to_owned()));
+    }
+
+    #[test]
+    fn apply_edits_accepts_right_edge_insertion_given_after_replacement() {
+        let edits = [
+            TextEdit::replace(Span::new(1, 4), "X"),
+            TextEdit::insert(4, "Y"),
+        ];
+
+        let result = apply_edits("abcdef", &edits);
+
+        assert_eq!(result, Ok("aXYef".to_owned()));
     }
 
     #[test]

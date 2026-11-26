@@ -1,12 +1,14 @@
 //! Integration tests for the v2 invariant: reconstructing the token stream
 //! reproduces the input byte-for-byte, on well-formed and broken input
 //! alike. Plus a small codemod demo built on `lex` + `TextEdit`, since that
-//! pairing is the whole point of the module, and a check that v1 and v2
-//! really do share their classification tables.
+//! pairing is the whole point of the module. Native classification and AST
+//! checks run without v1; the cross-version and bridge checks are opt-in.
 
 #![cfg(feature = "v2")]
 
-use poshtree::v2::{apply_edits, lex, reconstruct, TextEdit, Token, TokenKind};
+use poshtree::v2::{
+    apply_edits, lex, reconstruct, Span, TextEdit, Token, TokenKind, Trivia, TriviaKind,
+};
 
 fn assert_roundtrip(src: &str) {
     let out = lex(src);
@@ -69,11 +71,81 @@ fn corpus_roundtrips_exactly() {
 
 #[test]
 fn broken_corpus_reports_errors() {
-    for src in ["'open", "\"open $(", "@'\nx", "<# x", "${x", "y `"] {
-        assert!(
-            !lex(src).errors.is_empty(),
-            "expected at least one error for {src:?}"
-        );
+    use poshtree::v2::{parse, ParseError};
+
+    let cases = [
+        (
+            "'open",
+            vec![ParseError {
+                message: "unterminated string at 0..5".into(),
+                span: Span::new(0, 5),
+            }],
+        ),
+        (
+            "\"open $(",
+            vec![
+                ParseError {
+                    message: "unterminated subexpression in string at 6..8".into(),
+                    span: Span::new(6, 8),
+                },
+                ParseError {
+                    message: "unterminated string at 0..8".into(),
+                    span: Span::new(0, 8),
+                },
+            ],
+        ),
+        (
+            "@'\nx",
+            vec![ParseError {
+                message: "unterminated here-string at 0..4".into(),
+                span: Span::new(0, 4),
+            }],
+        ),
+        (
+            "<# x",
+            vec![ParseError {
+                message: "unterminated block comment at 0..4".into(),
+                span: Span::new(0, 4),
+            }],
+        ),
+        (
+            "${x",
+            vec![ParseError {
+                message: "unterminated braced variable at 0..3".into(),
+                span: Span::new(0, 3),
+            }],
+        ),
+        (
+            "y `",
+            vec![ParseError {
+                message: "dangling escape character at 2..3".into(),
+                span: Span::new(2, 3),
+            }],
+        ),
+        // BOM (three bytes), `(`, quote, and ż (two bytes): lexer errors
+        // precede parser recovery errors, both in original-input coordinates.
+        (
+            "\u{feff}('ż",
+            vec![
+                ParseError {
+                    message: "unterminated string at 4..7".into(),
+                    span: Span::new(4, 7),
+                },
+                ParseError {
+                    message: "expected ')'".into(),
+                    span: Span::new(7, 7),
+                },
+            ],
+        ),
+    ];
+    for (src, expected) in cases {
+        assert_parse_errors(src, expected);
+    }
+
+    fn assert_parse_errors(src: &str, expected: Vec<ParseError>) {
+        let out = parse(src);
+
+        assert_eq!(out.errors, expected, "diagnostics for {src:?}");
     }
 }
 
@@ -101,27 +173,64 @@ fn classification_tables_match_v1() {
     );
 }
 
-/// Behavioral agreement on top of the table equality above: both lexers
-/// classify every dash-word the same way, including the ones the shared
-/// table contents happen to leave out (`-iin` is a `Parameter` in both).
+const DASH_CASES: &[(&str, TokenKind)] = &[
+    ("-eq", TokenKind::Operator),
+    ("-Eq", TokenKind::Operator),
+    ("-iMatch", TokenKind::Operator),
+    ("-creplace", TokenKind::Operator),
+    ("-and", TokenKind::Operator),
+    ("-f", TokenKind::Operator),
+    ("-Path", TokenKind::Parameter),
+    ("-Force", TokenKind::Parameter),
+    ("-iin", TokenKind::Operator),
+    ("-cnotin", TokenKind::Operator),
+    ("-xyzzy", TokenKind::Parameter),
+];
+
+fn assert_native_word_kind(word: &str, kind: TokenKind) {
+    let out = lex(word);
+    let tokens: Vec<_> = out
+        .tokens
+        .iter()
+        .map(|t| (t.kind, t.value.as_str()))
+        .collect();
+
+    assert!(
+        out.errors.is_empty(),
+        "errors for {word:?}: {:?}",
+        out.errors
+    );
+    assert_eq!(tokens, [(kind, word), (TokenKind::Eof, "")], "{word:?}");
+}
+
+#[test]
+fn native_keyword_classification_is_case_insensitive_and_word_exact() {
+    for (word, kind) in [
+        ("if", TokenKind::Keyword),
+        ("ElSeIf", TokenKind::Keyword),
+        ("RETURN", TokenKind::Keyword),
+        ("if-only", TokenKind::Generic),
+        ("returning", TokenKind::Generic),
+    ] {
+        assert_native_word_kind(word, kind);
+    }
+}
+
+#[test]
+fn native_dash_classification_matches_literal_token_kinds() {
+    for &(word, kind) in DASH_CASES {
+        assert_native_word_kind(word, kind);
+    }
+}
+
+/// Behavioral agreement beyond the base tables: both lexers also recognize
+/// case-prefixed operators such as `-iin`.
 #[cfg(feature = "v1")]
 #[test]
 fn dash_classification_agrees_with_v1() {
     use poshtree::v1::tokens::TokenType;
 
-    for word in [
-        "-eq",
-        "-Eq",
-        "-iMatch",
-        "-creplace",
-        "-and",
-        "-f",
-        "-Path",
-        "-Force",
-        "-iin",
-        "-cnotin",
-        "-xyzzy",
-    ] {
+    for &(word, _) in DASH_CASES {
         let v1_is_op = poshtree::tokenize(word)
             .first()
             .map(|t| t.ty == TokenType::Operator)
@@ -218,12 +327,126 @@ Get-WmiObject inside a here-string stays put
 /// span gives the token text, including through multi-byte characters.
 #[test]
 fn spans_match_source_slices() {
-    let src = "Write-Output 'zażółć 🦀' -NoEnumerate # fin\n";
-    let out = lex(src);
-    for token in &out.tokens {
-        assert_eq!(token.span.slice(src), token.value);
-        for trivia in token.leading.iter().chain(&token.trailing) {
-            assert_eq!(trivia.span.slice(src), trivia.text);
+    let cases = [
+        (
+            "Write-Output 'zażółć 🦀' -NoEnumerate # fin\n",
+            vec![
+                Token {
+                    kind: TokenKind::Generic,
+                    value: "Write-Output".into(),
+                    span: Span::new(0, 12),
+                    leading: vec![],
+                    trailing: vec![Trivia {
+                        kind: TriviaKind::Whitespace,
+                        text: " ".into(),
+                        span: Span::new(12, 13),
+                    }],
+                },
+                Token {
+                    kind: TokenKind::StringSq,
+                    value: "'zażółć 🦀'".into(),
+                    span: Span::new(13, 30),
+                    leading: vec![],
+                    trailing: vec![Trivia {
+                        kind: TriviaKind::Whitespace,
+                        text: " ".into(),
+                        span: Span::new(30, 31),
+                    }],
+                },
+                Token {
+                    kind: TokenKind::Parameter,
+                    value: "-NoEnumerate".into(),
+                    span: Span::new(31, 43),
+                    leading: vec![],
+                    trailing: vec![
+                        Trivia {
+                            kind: TriviaKind::Whitespace,
+                            text: " ".into(),
+                            span: Span::new(43, 44),
+                        },
+                        Trivia {
+                            kind: TriviaKind::LineComment,
+                            text: "# fin".into(),
+                            span: Span::new(44, 49),
+                        },
+                        Trivia {
+                            kind: TriviaKind::Newline,
+                            text: "\n".into(),
+                            span: Span::new(49, 50),
+                        },
+                    ],
+                },
+                Token {
+                    kind: TokenKind::Eof,
+                    value: "".into(),
+                    span: Span::new(50, 50),
+                    leading: vec![],
+                    trailing: vec![],
+                },
+            ],
+        ),
+        (
+            "\u{feff}# ż\r\n  ls\n ",
+            vec![
+                Token {
+                    kind: TokenKind::Generic,
+                    value: "ls".into(),
+                    span: Span::new(11, 13),
+                    leading: vec![
+                        Trivia {
+                            kind: TriviaKind::Whitespace,
+                            text: "\u{feff}".into(),
+                            span: Span::new(0, 3),
+                        },
+                        Trivia {
+                            kind: TriviaKind::LineComment,
+                            text: "# ż".into(),
+                            span: Span::new(3, 7),
+                        },
+                        Trivia {
+                            kind: TriviaKind::Newline,
+                            text: "\r\n".into(),
+                            span: Span::new(7, 9),
+                        },
+                        Trivia {
+                            kind: TriviaKind::Whitespace,
+                            text: "  ".into(),
+                            span: Span::new(9, 11),
+                        },
+                    ],
+                    trailing: vec![Trivia {
+                        kind: TriviaKind::Newline,
+                        text: "\n".into(),
+                        span: Span::new(13, 14),
+                    }],
+                },
+                Token {
+                    kind: TokenKind::Eof,
+                    value: "".into(),
+                    span: Span::new(15, 15),
+                    leading: vec![Trivia {
+                        kind: TriviaKind::Whitespace,
+                        text: " ".into(),
+                        span: Span::new(14, 15),
+                    }],
+                    trailing: vec![],
+                },
+            ],
+        ),
+    ];
+    for (src, expected) in cases {
+        assert_token_spans(src, expected);
+    }
+
+    fn assert_token_spans(src: &str, expected: Vec<Token>) {
+        let out = lex(src);
+
+        assert_eq!(out.tokens, expected, "tokens and trivia for {src:?}");
+        for token in &out.tokens {
+            assert_eq!(token.span.slice(src), token.value);
+            for trivia in token.leading.iter().chain(&token.trailing) {
+                assert_eq!(trivia.span.slice(src), trivia.text);
+            }
         }
     }
 }
@@ -281,6 +504,39 @@ $os = Get-CimInstance Win32_OperatingSystem
     assert_eq!(parse_with_tokens(&rewritten).unparse_lossless(), rewritten);
 }
 
+#[test]
+fn native_codemod_rewrites_only_pipeline_command_names_by_span() {
+    use poshtree::v2::{parse, NodeKind};
+
+    let src = "\u{feff}# ż inventory\r\n\
+               Get-WmiObject Outside   # leave the standalone call\r\n\
+               get-wmiobject Win32_BIOS | Write-Output Get-WmiObject  # keep\r\n";
+
+    let out = parse(src);
+    let mut edits = Vec::new();
+    out.script.walk_with_ancestors(&mut |node, ancestors| {
+        if let NodeKind::Command { name, .. } = &node.kind {
+            if matches!(ancestors, [root, pipeline]
+                if matches!(root.kind, NodeKind::Script(_))
+                    && matches!(pipeline.kind, NodeKind::Pipeline(_)))
+                && matches!(&name.kind, NodeKind::BareWord(word)
+                    if word.eq_ignore_ascii_case("Get-WmiObject"))
+            {
+                edits.push(TextEdit::replace(name.span, "Get-CimInstance"));
+            }
+        }
+    });
+    let rewritten = apply_edits(src, &edits).unwrap();
+
+    assert!(out.errors.is_empty(), "native errors: {:?}", out.errors);
+    assert_eq!(
+        rewritten,
+        "\u{feff}# ż inventory\r\n\
+         Get-WmiObject Outside   # leave the standalone call\r\n\
+         Get-CimInstance Win32_BIOS | Write-Output Get-WmiObject  # keep\r\n"
+    );
+}
+
 /// The native v2 parser, used standalone (no v1): it parses, finds commands,
 /// and every node's span slices back to its own source.
 #[test]
@@ -289,7 +545,9 @@ fn native_parser_extracts_commands_and_spans() {
     use poshtree::v2::NodeKind;
 
     let src = "Get-ChildItem -Path . | Sort-Object Length | Select-Object -First 3\n";
+
     let out = parse(src);
+
     assert!(out.errors.is_empty(), "{:?}", out.errors);
 
     let mut commands = Vec::new();
@@ -298,36 +556,74 @@ fn native_parser_extracts_commands_and_spans() {
             if let NodeKind::BareWord(s) = &name.kind {
                 // the name node's span slices to the command name
                 assert_eq!(name.span.slice(src), s);
-                commands.push(s.clone());
+                commands.push((s.clone(), name.span));
             }
         }
     });
-    assert_eq!(commands, ["Get-ChildItem", "Sort-Object", "Select-Object"]);
+    assert_eq!(
+        commands,
+        [
+            ("Get-ChildItem".to_string(), Span::new(0, 13)),
+            ("Sort-Object".to_string(), Span::new(24, 35)),
+            ("Select-Object".to_string(), Span::new(45, 58)),
+        ]
+    );
 }
 
-/// Differential oracle: the native v2 parser and the v1-correlation tree must
-/// find the same commands. While v1 exists, it keeps the native parser honest.
-#[cfg(feature = "v1")]
-#[test]
-fn native_parser_agrees_with_correlation_tree_on_commands() {
-    use poshtree::v1::ast::AstNode;
-    use poshtree::v2::parser::parse;
-    use poshtree::v2::tree::parse_with_tokens;
-    use poshtree::v2::NodeKind;
+/// Both parser paths must independently find the literal command sets, so
+/// agreement cannot hide a shared omission or an argument mistaken for a call.
+fn command_cases() -> [(&'static str, &'static [&'static str]); 9] {
+    [
+        (
+            "Get-Process | Where-Object { $_.CPU -gt 10 } | Sort-Object CPU\n",
+            &["get-process", "sort-object", "where-object"],
+        ),
+        (
+            "$files = Get-ChildItem -Path C:\\temp -Recurse\n",
+            &["get-childitem"],
+        ),
+        (
+            "if (Test-Path $p) { Remove-Item $p } else { New-Item $p }\n",
+            &["new-item", "remove-item", "test-path"],
+        ),
+        (
+            "function Save { param($x) Set-Content -Path out.txt -Value $x }\n",
+            &["set-content"],
+        ),
+        (
+            "foreach ($f in Get-ChildItem) { Write-Output $f.Name }\n",
+            &["get-childitem", "write-output"],
+        ),
+        (
+            "$d = $(Get-Date); Write-Host $d\n",
+            &["get-date", "write-host"],
+        ),
+        (
+            "Get-Service | ForEach-Object { Start-Service $_ }\n",
+            &["foreach-object", "get-service", "start-service"],
+        ),
+        (
+            "try { Invoke-Thing } catch { Write-Error 'fail' }\n",
+            &["invoke-thing", "write-error"],
+        ),
+        (
+            "while (Test-Connection $h) { Start-Sleep 1 }\n",
+            &["start-sleep", "test-connection"],
+        ),
+    ]
+}
 
-    let corpus = [
-        "Get-Process | Where-Object { $_.CPU -gt 10 } | Sort-Object CPU\n",
-        "$files = Get-ChildItem -Path C:\\temp -Recurse\n",
-        "if (Test-Path $p) { Remove-Item $p } else { New-Item $p }\n",
-        "function Save { param($x) Set-Content -Path out.txt -Value $x }\n",
-        "foreach ($f in Get-ChildItem) { Write-Output $f.Name }\n",
-        "$d = $(Get-Date); Write-Host $d\n",
-        "Get-Service | ForEach-Object { Start-Service $_ }\n",
-        "try { Invoke-Thing } catch { Write-Error 'fail' }\n",
-        "while (Test-Connection $h) { Start-Sleep 1 }\n",
-    ];
-    for src in corpus {
+#[test]
+fn native_parser_matches_literal_commands() {
+    use poshtree::v2::{parse, NodeKind};
+
+    for (src, expected) in command_cases() {
+        assert_native_commands(src, expected);
+    }
+
+    fn assert_native_commands(src: &str, expected: &[&str]) {
         let out = parse(src);
+
         assert!(
             out.errors.is_empty(),
             "native errors for {src:?}: {:?}",
@@ -344,17 +640,33 @@ fn native_parser_agrees_with_correlation_tree_on_commands() {
             }
         });
 
+        native.sort();
+        assert_eq!(native, expected, "native commands for {src:?}");
+    }
+}
+
+#[cfg(feature = "v1")]
+#[test]
+fn correlation_tree_matches_literal_commands() {
+    use poshtree::v1::ast::AstNode;
+    use poshtree::v2::tree::parse_with_tokens;
+
+    for (src, expected) in command_cases() {
+        assert_correlated_commands(src, expected);
+    }
+
+    fn assert_correlated_commands(src: &str, expected: &[&str]) {
         let tree = parse_with_tokens(src);
-        let mut oracle: Vec<String> = Vec::new();
+
+        let mut correlated: Vec<String> = Vec::new();
         tree.walk_zipped(&mut |ast, _, _| {
             if let AstNode::Command(c) = ast {
-                oracle.push(c.name.to_ascii_lowercase());
+                correlated.push(c.name.to_ascii_lowercase());
             }
         });
 
-        native.sort();
-        oracle.sort();
-        assert_eq!(native, oracle, "command sets differ for {src:?}");
+        correlated.sort();
+        assert_eq!(correlated, expected, "correlated commands for {src:?}");
     }
 }
 

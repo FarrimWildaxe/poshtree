@@ -1,9 +1,8 @@
 //! C# name resolution for the Add-Type dialect.
 //!
-//! C# scoping is lexical and static, so binding can be exact rather than
-//! heuristic. [`resolve`] walks a [`CsUnit`] and produces a [`Resolved`] that
-//! answers two questions renaming needs: what symbols are declared, and which
-//! source spans reference a given symbol.
+//! [`resolve`] walks one [`CsUnit`] and produces a [`Resolved`] containing
+//! declarations and reference spans selected by a bounded syntactic model.
+//! It is not a full C# semantic binder and does not connect separate units.
 //!
 //! The model:
 //!
@@ -11,10 +10,19 @@
 //!   declared later in the same type.
 //! * A root identifier (not after `.`/`::`) binds to the nearest enclosing
 //!   declaration, so a local shadows a field and a parameter shadows a field.
-//! * A member-access identifier (after `.`/`::`) binds by name to the unit's
-//!   member declarations. Within a single file (the Add-Type case) that is
-//!   accurate; the one ambiguity, two declared members sharing a name, is
-//!   documented rather than guessed away.
+//! * Member access (after `.`/`::`) uses the member name and simple owner name.
+//!   `this` and `base` consult the stored in-unit base lists; a bare receiver
+//!   matching the declaring type's name also qualifies. Other or unknown
+//!   receivers are omitted, without inferring local/parameter receiver types.
+//! * Owner/base indexes use simple type names, not qualified identities.
+//!   Same-named types in different namespaces can therefore be conflated.
+//! * The first same-named declaration in a scope receives bare references;
+//!   overload signatures are not selected. Same-owner, same-name member-access
+//!   sites can be returned for multiple overloads.
+//!
+//! These rules do not guarantee complete references, semantic rename safety,
+//! or refusal of ambiguous input. External types and `using` directives are
+//! not semantically resolved.
 
 use super::ast::{CsName, CsNode, CsNodeKind, CsUnit};
 use crate::v2::span::Span;
@@ -44,8 +52,8 @@ pub enum DeclKind {
 }
 
 impl DeclKind {
-    /// Whether this kind can be reached through member access (`x.Name`), and
-    /// so collects after-dot references by name.
+    /// Whether this kind participates in after-dot matching by name and the
+    /// supported receiver/owner rules.
     fn is_member(self) -> bool {
         matches!(
             self,
@@ -132,8 +140,8 @@ impl Resolved {
         &self.decls
     }
 
-    /// The name of the type that encloses a declaration, if any. Lets a caller
-    /// scope a rename to one type's members.
+    /// The simple name of the type that encloses a declaration, if any. This
+    /// supports name-based owner filtering, not qualified type identity.
     pub fn enclosing_type(&self, decl_id: usize) -> Option<&str> {
         let scope = self.decls.get(decl_id)?.scope;
         self.type_of_scope.get(scope)?.as_deref()
@@ -160,13 +168,20 @@ impl Resolved {
         self.decls.get(id)
     }
 
-    /// Every span that should change when this declaration is renamed: the
-    /// declaration name itself, every root reference bound to it, and (for a
-    /// member kind) every member access of the same name reached through a
-    /// receiver that can only be this member: `this`, `base`, or the declaring
-    /// type's name (a static use like `Type.Member`). A member access through
-    /// some other receiver (`other.Member`, `s.Length`) is left out, since its
-    /// type is unknown. Sorted by start, deduplicated.
+    /// Spans selected for this declaration by the resolver's model: its name,
+    /// bound root references, and (for a member kind) same-name accesses through
+    /// supported receivers. These are `this`, `base` via stored in-unit bases,
+    /// or a bare name matching the simple owner name (`Type.Member`). This
+    /// last check compares text, not the receiver's semantic identity.
+    /// Other receivers (`other.Member`, `s.Length`, `foo().Member`) are omitted.
+    /// Results are sorted by start and deduplicated; invalid ids return empty.
+    ///
+    /// Root references include the stored base type/interface names from type
+    /// declarations, bound in the surrounding scope rather than the type body.
+    /// Only the stored final identifiers are included, not qualifiers or generic
+    /// arguments. Type declarations also collect constructor names and their
+    /// bound references by simple owner name. Overloads and same-named types
+    /// retain the limitations described at module level.
     pub fn references_of(&self, decl_id: usize) -> Vec<Span> {
         let Some(decl) = self.decls.get(decl_id) else {
             return Vec::new();
@@ -219,14 +234,11 @@ impl Resolved {
         spans
     }
 
-    /// Whether a member-access receiver can only denote the current member's
-    /// owner. `this` qualifies for a member of the enclosing type or one it
-    /// inherits, binding to the most-derived declarer so a shadowed member
-    /// renames against the shadowing type. `base.X` binds to the nearest
-    /// ancestor that declares `X`, via the type-to-bases map; an external base
-    /// (not present in the unit) ends the chain without binding. A bare-name
-    /// receiver qualifies when it is the declaring type's name (static access),
-    /// from anywhere. An unknown receiver (`None`) never qualifies.
+    /// Whether a receiver matches the simple-name owner model. `this` searches
+    /// breadth-first from the enclosing type; `base` searches from each stored
+    /// base. Missing external bases end that branch. A bare receiver matching
+    /// the owner's text qualifies from anywhere, without semantic validation.
+    /// An unknown receiver (`None`) never qualifies.
     fn receiver_is_this_member(&self, m: &MemberRef, owner: Option<&str>) -> bool {
         let Some(owner) = owner else {
             return false;
@@ -285,7 +297,7 @@ impl Resolved {
     }
 }
 
-/// Resolves a parsed C# unit.
+/// Resolves one parsed C# unit using the bounded rules described in this module.
 pub fn resolve(unit: &CsUnit) -> Resolved {
     let mut b = Builder {
         scopes: Vec::new(),
@@ -350,6 +362,16 @@ impl Builder {
                         .entry(name.text.clone())
                         .or_default()
                         .extend(bases.iter().map(|b| b.text.clone()));
+                }
+                // Header names must not bind to members declared in the body.
+                for base in bases {
+                    self.refs.push(RefSite {
+                        text: base.text.clone(),
+                        span: base.span,
+                        after_dot: false,
+                        receiver: None,
+                        scope,
+                    });
                 }
                 let inner = self.new_scope(Some(scope), ScopeKind::Type);
                 self.type_of_scope[inner] = Some(name.text.clone());
@@ -546,6 +568,121 @@ mod tests {
     }
 
     #[test]
+    fn type_references_include_stored_base_name() {
+        let unit = cs_parse("class Base {} class Child : Base {}", 0);
+
+        let r = resolve(&unit);
+
+        let base = *r.find("Base", Some(DeclKind::Type)).first().unwrap();
+        assert_eq!(
+            r.references_of(base),
+            vec![Span::new(6, 10), Span::new(28, 32)]
+        );
+    }
+
+    #[test]
+    fn type_references_include_base_name_declared_later() {
+        let unit = cs_parse("class Child : Base {} class Base {}", 0);
+
+        let r = resolve(&unit);
+
+        let base = *r.find("Base", Some(DeclKind::Type)).first().unwrap();
+        assert_eq!(
+            r.references_of(base),
+            vec![Span::new(14, 18), Span::new(28, 32)]
+        );
+    }
+
+    #[test]
+    fn type_references_bind_base_header_outside_child_field_scope() {
+        let unit = cs_parse("class Base {} class Child : Base { int Base; }", 0);
+
+        let r = resolve(&unit);
+
+        let base = *r.find("Base", Some(DeclKind::Type)).first().unwrap();
+        let field = *r.find("Base", Some(DeclKind::Field)).first().unwrap();
+        assert_eq!(
+            r.references_of(base),
+            vec![Span::new(6, 10), Span::new(28, 32)]
+        );
+        assert_eq!(r.references_of(field), vec![Span::new(39, 43)]);
+    }
+
+    #[test]
+    fn type_references_include_each_base_and_interface_entry() {
+        let unit = cs_parse(
+            "class Base {} interface IOne {} interface ITwo {} class Child : Base, IOne, ITwo {}",
+            0,
+        );
+
+        let r = resolve(&unit);
+
+        let base = *r.find("Base", Some(DeclKind::Type)).first().unwrap();
+        let one = *r.find("IOne", Some(DeclKind::Type)).first().unwrap();
+        let two = *r.find("ITwo", Some(DeclKind::Type)).first().unwrap();
+        assert_eq!(
+            r.references_of(base),
+            vec![Span::new(6, 10), Span::new(64, 68)]
+        );
+        assert_eq!(
+            r.references_of(one),
+            vec![Span::new(24, 28), Span::new(70, 74)]
+        );
+        assert_eq!(
+            r.references_of(two),
+            vec![Span::new(42, 46), Span::new(76, 80)]
+        );
+    }
+
+    #[test]
+    fn type_references_include_generic_base_outer_name_only() {
+        let unit = cs_parse(
+            "class Base<T> {} class Arg {} class Child : Base<Arg> {}",
+            0,
+        );
+
+        let r = resolve(&unit);
+
+        let base = *r.find("Base", Some(DeclKind::Type)).first().unwrap();
+        let arg = *r.find("Arg", Some(DeclKind::Type)).first().unwrap();
+        assert_eq!(
+            r.references_of(base),
+            vec![Span::new(6, 10), Span::new(44, 48)]
+        );
+        assert_eq!(r.references_of(arg), vec![Span::new(23, 26)]);
+    }
+
+    #[test]
+    fn unresolved_base_name_does_not_reference_unrelated_field() {
+        let unit = cs_parse(
+            "class Child : Missing {} class Other { int Missing; void M() { Missing = 1; } }",
+            0,
+        );
+
+        let r = resolve(&unit);
+
+        let field = *r.find("Missing", Some(DeclKind::Field)).first().unwrap();
+        assert_eq!(
+            r.references_of(field),
+            vec![Span::new(43, 50), Span::new(63, 70)]
+        );
+        assert_eq!(r.find("Missing", Some(DeclKind::Type)), vec![]);
+    }
+
+    #[test]
+    fn type_references_preserve_absolute_utf8_base_name_spans() {
+        let unit = cs_parse("// é\nclass Bäse {} class Child : Bäse {}", 40);
+
+        let r = resolve(&unit);
+
+        let base = *r.find("Bäse", Some(DeclKind::Type)).first().unwrap();
+        assert_eq!(
+            r.references_of(base),
+            vec![Span::new(52, 57), Span::new(75, 80)]
+        );
+    }
+
+    #[test]
     fn generic_argument_is_not_treated_as_a_base() {
         // `class C : Dictionary<string, List>` does not make C inherit List, so
         // a List member is not reached through C.
@@ -611,19 +748,33 @@ mod tests {
     }
 
     #[test]
-    fn external_and_cyclic_bases_are_safe() {
-        // A base type not present in the unit ends the chain (no false bind),
-        // and a cyclic base list does not loop.
-        let external = "class B : ExternalThing { public void U() { base.DoIt(); } }";
-        let r = resolve_src(external);
-        assert!(r.find("DoIt", Some(DeclKind::Method)).is_empty());
+    fn external_base_does_not_introduce_method_declaration() {
+        let unit = cs_parse(
+            "class B : ExternalThing { public void U() { base.DoIt(); } }",
+            0,
+        );
 
-        let cyclic =
-            "class A : B { public int X; }\nclass B : A { public void U() { this.X = 1; } }";
-        let r = resolve_src(cyclic);
-        // Must terminate; X resolves to the single declaration plus the this use.
-        let x = *r.find("X", Some(DeclKind::Field)).first().unwrap();
-        assert!(!r.references_of(x).is_empty());
+        let r = resolve(&unit);
+
+        assert_eq!(r.find("DoIt", Some(DeclKind::Method)), vec![]);
+    }
+
+    #[test]
+    fn cyclic_bases_preserve_inherited_this_field_reference() {
+        let unit = cs_parse(
+            "class A : B { public int X; }\nclass B : A { public void U() { this.X = 1; } }",
+            0,
+        );
+
+        let r = resolve(&unit);
+
+        let fields = r.find("X", Some(DeclKind::Field));
+        assert_eq!(fields.len(), 1);
+        let x = fields[0];
+        assert_eq!(
+            r.references_of(x),
+            vec![Span::new(25, 26), Span::new(67, 68)]
+        );
     }
 
     #[test]

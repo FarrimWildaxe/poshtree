@@ -2,15 +2,27 @@
 //!
 //! `Add-Type` embeds C# in a PowerShell string. PowerShell tools can see the
 //! string but not its structure; this module adds a self-contained C# front
-//! end (lexer, parser, name resolver) over the exact source region the C#
-//! occupies, so a C# type or member can be found, its references resolved, and
-//! the matching PowerShell call sites kept in sync.
+//! end (lexer, parser, bounded name resolver) over the source region the C#
+//! occupies. Refactoring helpers collect edits for declarations, references
+//! selected by that resolver, and recognized PowerShell name sites.
 //!
-//! Scope is a single file: the C# in the PowerShell script being processed.
-//! There is no assembly or reference resolution, and BCL types are treated as
-//! unresolved externals. Constructs outside the supported dialect degrade to
-//! error nodes rather than failing the parse, the same way the PowerShell
-//! parser recovers.
+//! The C# lexer discards whitespace and comments and emits significant tokens;
+//! its shallow AST is not lossless. This differs from the outer lossless
+//! PowerShell token stream, which retains the embedded string's source text.
+//! Refactors apply span edits to the original source, copying untouched bytes
+//! through rather than regenerating C# from the AST.
+//!
+//! Legacy resolution is per [`ast::CsUnit`], not shared across `Add-Type` blocks.
+//! Ownership uses simple type names; there is no assembly/reference resolution
+//! or full C# semantic binding. Unknown receiver types are not inferred, and
+//! overload selection and namespace-qualified identity are not modeled.
+//! Unmatched input recovers into error nodes rather than failing the parse;
+//! other expression detail is modeled generically.
+//!
+//! For a caller-selected raw C# region, [`CheckedCSharpRegion`] is a separate
+//! opt-in path: it plans a complete rename within its bounded model or returns
+//! a typed refusal. It does not consult the legacy collectors or edit
+//! PowerShell sites.
 //!
 //! # Step 1: locating the code
 //!
@@ -22,14 +34,19 @@ use super::ast::{Node, NodeKind};
 use super::span::Span;
 
 pub mod ast;
+mod checked;
 pub mod imports;
 pub mod lexer;
+mod local;
 pub mod parser;
 pub mod refactor;
 pub mod resolve;
 pub mod tokens;
 pub mod xlang;
 
+pub use checked::{
+    CSharpMember, CSharpRenameError, CSharpRenameMode, CSharpRenamePlan, CheckedCSharpRegion,
+};
 pub use imports::{csharp_imports, csharp_imports_and_apis};
 pub use refactor::{
     add_csharp_comment, csharp_references, csharp_symbols, csharp_unit, rename_csharp_field,

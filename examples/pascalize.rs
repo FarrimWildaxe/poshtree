@@ -17,10 +17,13 @@
 //! Only command *invocations* are touched. Function-definition names, call
 //! operator targets (`& $cmd`), dot-sourced paths (`. .\x.ps1`), and anything
 //! that is not a plain identifier are left alone.
+//!
+//! If applying edits fails, the program reports the error to stderr and exits
+//! unsuccessfully without printing source or a success count.
 
 use std::process::ExitCode;
 
-use poshtree::v2::{apply_edits, parse, NodeKind, TextEdit};
+use poshtree::v2::{apply_edits, parse, EditError, NodeKind, TextEdit};
 
 const DEMO: &str = "\
 get-childitem -Path . -recurse |
@@ -47,7 +50,13 @@ fn main() -> ExitCode {
         }
     };
 
-    let (output, changed) = pascalize(&source);
+    let (output, changed) = match pascalize(&source) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("pascalize: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     print!("{output}");
     eprintln!("pascalize: capitalized {changed} command name(s)");
     ExitCode::SUCCESS
@@ -68,7 +77,16 @@ fn load_source(args: &[String]) -> std::io::Result<String> {
 
 /// Rewrites command names in `src` to PascalCase, returning the new source and
 /// the number of names that changed.
-fn pascalize(src: &str) -> (String, usize) {
+///
+/// Returns an error if the collected edits cannot be applied.
+fn pascalize(src: &str) -> Result<(String, usize), EditError> {
+    pascalize_with_apply(src, apply_edits)
+}
+
+fn pascalize_with_apply(
+    src: &str,
+    apply: impl FnOnce(&str, &[TextEdit]) -> Result<String, EditError>,
+) -> Result<(String, usize), EditError> {
     let parsed = parse(src);
 
     let mut edits: Vec<TextEdit> = Vec::new();
@@ -85,10 +103,8 @@ fn pascalize(src: &str) -> (String, usize) {
     });
 
     let changed = edits.len();
-    // Each command name is a distinct token, so the spans never overlap and
-    // apply_edits cannot fail here; keep the original text if that ever changes.
-    let output = apply_edits(src, &edits).unwrap_or_else(|_| src.to_string());
-    (output, changed)
+    let output = apply(src, &edits)?;
+    Ok((output, changed))
 }
 
 /// PascalCases a plain-identifier command name: every `-`-separated segment
@@ -152,20 +168,79 @@ mod tests {
     #[test]
     fn rewrites_commands_but_not_strings_or_params() {
         let src = "get-process -Name \"get-thing\" | where-object { $_.Id }\n";
-        let (out, changed) = pascalize(src);
-        assert_eq!(changed, 2); // get-process, where-object
-        assert!(out.contains("Get-Process"));
-        assert!(out.contains("Where-Object"));
-        assert!(out.contains("\"get-thing\"")); // the string argument is untouched
-        assert!(out.contains("-Name")); // the parameter is untouched
+
+        let result = pascalize(src);
+
+        assert_eq!(
+            result,
+            Ok((
+                "Get-Process -Name \"get-thing\" | Where-Object { $_.Id }\n".to_string(),
+                2,
+            ))
+        );
+    }
+
+    #[test]
+    fn pascalize_empty_source_returns_empty_output_and_zero_changes() {
+        let src = "";
+
+        let result = pascalize(src);
+
+        assert_eq!(result, Ok((String::new(), 0)));
+    }
+
+    #[test]
+    fn pascalize_already_cased_commands_returns_unchanged_output_and_zero_changes() {
+        let src = "Get-ChildItem | Sort-Object\n";
+
+        let result = pascalize(src);
+
+        assert_eq!(result, Ok(("Get-ChildItem | Sort-Object\n".to_string(), 0)));
+    }
+
+    #[test]
+    fn pascalize_preserves_unicode_and_untouched_text_when_rewriting_commands() {
+        let src = "# café 🦀\nfunction get-greeting {\n    write-output \"héllo, 世界\" -NoNewline # naïve\n}\n& $external --raw\n. .\\profile.ps1\n";
+
+        let result = pascalize(src);
+
+        assert_eq!(
+            result,
+            Ok((
+                "# café 🦀\nfunction get-greeting {\n    Write-Output \"héllo, 世界\" -NoNewline # naïve\n}\n& $external --raw\n. .\\profile.ps1\n".to_string(),
+                1,
+            ))
+        );
+    }
+
+    #[test]
+    fn pascalize_with_apply_propagates_edit_error_without_success_output_or_count() {
+        let src = "get-process\n";
+
+        let result = pascalize_with_apply(src, |_, _| {
+            Err(EditError::Overlap {
+                first: poshtree::v2::Span { start: 0, end: 4 },
+                second: poshtree::v2::Span { start: 2, end: 6 },
+            })
+        });
+
+        assert_eq!(
+            result,
+            Err(EditError::Overlap {
+                first: poshtree::v2::Span { start: 0, end: 4 },
+                second: poshtree::v2::Span { start: 2, end: 6 },
+            })
+        );
     }
 
     #[test]
     fn output_is_idempotent() {
         let src = "get-childitem | sort-object\n";
-        let (once, _) = pascalize(src);
-        let (twice, second_pass) = pascalize(&once);
-        assert_eq!(once, twice);
-        assert_eq!(second_pass, 0);
+        let (once, _) = pascalize(src).expect("valid command spans can be applied");
+
+        let result = pascalize(&once);
+
+        assert_eq!(result, Ok(("Get-Childitem | Sort-Object\n".to_string(), 0)));
+        assert_eq!(once, "Get-Childitem | Sort-Object\n");
     }
 }

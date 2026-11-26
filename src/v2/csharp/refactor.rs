@@ -1,11 +1,16 @@
 //! C#-side refactoring over Add-Type blocks.
 //!
-//! Built on the resolver, these helpers turn a symbol into the edits that
-//! rename it correctly: the declaration plus every reference the resolver bound
-//! to it, with shadowing respected. C# is case-sensitive, so matching here is
-//! exact. Everything returns [`Vec<TextEdit>`] (a comment returns one), so the
-//! results compose through [`apply_edits`](crate::v2::apply_edits) and any
-//! overlap with another refactor is reported rather than silently applied.
+//! These helpers return edits for a declaration and the references selected by
+//! the per-unit resolver's limited scope and simple-owner-name model. C# name
+//! comparisons here are case-sensitive; full semantic binding, overload
+//! selection, collision detection, and replacement-identifier validation are
+//! not provided.
+//!
+//! Rename results are [`Vec<TextEdit>`] (a comment helper returns one edit).
+//! [`apply_edits`](crate::v2::apply_edits) applies them to the original source,
+//! preserving untouched bytes even though the C# lexer discards trivia and the
+//! AST is not lossless. The applier rejects invalid or overlapping spans; those
+//! errors are not semantic rename errors or name-collision checks.
 
 use super::ast::{CsNode, CsUnit};
 use super::csharp_code_span;
@@ -30,8 +35,9 @@ pub fn csharp_symbols(unit: &CsUnit) -> Vec<Decl> {
     resolve(unit).symbols().to_vec()
 }
 
-/// Every span that references the declaration whose name is at `name_span`
-/// (including the declaration itself). Empty if no declaration sits there.
+/// Spans selected by the resolver for the declaration at `name_span`, including
+/// the declaration itself. Empty if no declaration sits there. Coverage follows
+/// [`super::resolve`]'s receiver, simple-name, and overload limits.
 pub fn csharp_references(unit: &CsUnit, name_span: Span) -> Vec<Span> {
     let r = resolve(unit);
     match r.decl_at(name_span) {
@@ -42,7 +48,8 @@ pub fn csharp_references(unit: &CsUnit, name_span: Span) -> Vec<Span> {
 
 /// Renames the C# declaration whose name is at `name_span`, plus every
 /// reference bound to it, to `to`. Works for any symbol kind. Returns no edits
-/// if no declaration is at `name_span`.
+/// if no declaration is at `name_span`. Does not validate `to`, detect name
+/// collisions, or refuse semantic ambiguities.
 ///
 /// For an overloaded method, bare call sites bind to the first overload, so
 /// renaming a single overload this way is incomplete; use
@@ -68,16 +75,18 @@ pub fn rename_csharp_parameter(unit: &CsUnit, name_span: Span, to: &str) -> Vec<
     rename_kind(unit, name_span, to, DeclKind::Param)
 }
 
-/// Renames a field `from` declared in type `type_name`, plus its references
-/// (bare uses bound to it, and `this.from`/`obj.from` member accesses). C#
-/// case-sensitive match.
+/// Renames a field `from` declared under simple owner name `type_name`, plus
+/// resolver-bound bare uses and supported `this.from`, `base.from`, and
+/// `type_name.from` accesses. Arbitrary `obj.from` receivers are not inferred.
+/// Names are compared case-sensitively.
 pub fn rename_csharp_field(unit: &CsUnit, type_name: &str, from: &str, to: &str) -> Vec<TextEdit> {
     rename_member_named(unit, type_name, from, to, DeclKind::Field)
 }
 
-/// Renames a method `from` declared in type `type_name`, plus its references
-/// (bare and member-access call sites). Renames the whole method group when
-/// `from` is overloaded.
+/// Renames methods `from` under simple owner name `type_name`, plus bare and
+/// supported member-access references selected by the resolver. Names are
+/// compared case-sensitively. Renames the whole same-name overload group,
+/// without selecting overload signatures or inferring arbitrary receivers.
 pub fn rename_csharp_method(unit: &CsUnit, type_name: &str, from: &str, to: &str) -> Vec<TextEdit> {
     rename_member_named(unit, type_name, from, to, DeclKind::Method)
 }

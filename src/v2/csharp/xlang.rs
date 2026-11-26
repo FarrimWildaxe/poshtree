@@ -1,6 +1,7 @@
 //! Cross-language renaming: a C# type or member defined in an `Add-Type` block
-//! is used directly from PowerShell as ordinary syntax, and these helpers keep
-//! both sides in sync in one edit set.
+//! can be used directly from PowerShell as ordinary syntax. These helpers
+//! collect one edit set for resolver-selected C# references and recognized
+//! PowerShell name sites, not all possible runtime uses.
 //!
 //! The C# side comes from the resolver (declaration plus bound references). The
 //! PowerShell side is read straight from the v2 tree, where the constructs that
@@ -14,12 +15,20 @@
 //!   [`MemberAccess`](NodeKind::MemberAccess) /
 //!   [`InvokeMember`](NodeKind::InvokeMember) whose target is the type literal.
 //!
-//! C# is case-sensitive but PowerShell resolves type and member names without
-//! regard to case, so the PowerShell side matches case-insensitively and is
-//! rewritten to the new canonical name. Matching is by name within the file, so
-//! the instance form `$obj.Member` (whose receiver type is unknown) is left
-//! alone, and the rare clash of two declared symbols sharing a name is
-//! documented rather than guessed.
+//! C# declaration/owner comparisons are case-sensitive. PowerShell-side name,
+//! command, and parameter comparisons here ignore ASCII case only, not general
+//! Unicode case. Type matching uses simple names in bracketed/quoted type text;
+//! bareword type arguments require a whole-text match. Instance `$obj.Member`
+//! uses are left alone. Static members use stored parser spans and accept only
+//! nonempty names whose characters are all Unicode alphanumeric or `_`.
+//!
+//! Each embedded C# unit is resolved independently. Simple-name ownership and
+//! overload limits still apply; this is not full semantic binding and does not
+//! guarantee refusal of ambiguous same-named symbols. PowerShell matches are
+//! syntactic and do not require a corresponding C# declaration to be found.
+//! Apply edits to the original source to preserve untouched bytes;
+//! [`apply_edits`](crate::v2::apply_edits) validates spans and overlap, not
+//! semantic rename validity, replacement names, or collisions.
 
 use super::refactor::csharp_unit;
 use super::resolve::{resolve, DeclKind};
@@ -27,13 +36,22 @@ use crate::v2::ast::{Node, NodeKind, StringKind};
 use crate::v2::edit::TextEdit;
 use crate::v2::span::Span;
 
-/// Renames a C# type `from` to `to` everywhere it is defined or used: the C#
-/// declaration, references within the C#, and PowerShell call sites
+/// Renames a C# type `from` to `to`: the C# declaration, resolver-bound
+/// references within the C#, and PowerShell call sites
 /// (`[from]`, `[from]$x`, `[from]::...`, `New-Object from`).
+///
+/// C# references include the stored final identifiers in base-class and
+/// interface lists when they bind to a type declared in the same embedded C#
+/// unit. Binding uses simple names, not namespace-qualified type identity;
+/// generic arguments in those lists are not tracked. This is not full C#
+/// semantic resolution. C# comments and string literal contents are left alone.
 ///
 /// `scope` is the PowerShell subtree to operate within (the whole script, or a
 /// narrower node); `src` is the file. Returns edits to apply with
 /// [`apply_edits`](crate::v2::apply_edits).
+/// PowerShell matching also includes `Add-Type -Name` arguments, class/enum
+/// declaration names, and class base headers. It uses ASCII-insensitive
+/// syntactic matching, not a shared PowerShell/C# type identity.
 pub fn rename_type(scope: &Node, src: &str, from: &str, to: &str) -> Vec<TextEdit> {
     let mut spans = Vec::new();
     // C# side: the declaration and its in-C# references, per Add-Type block.
@@ -51,6 +69,16 @@ pub fn rename_type(scope: &Node, src: &str, from: &str, to: &str) -> Vec<TextEdi
 /// Renames a C# member `from` (field, method, property, or enum member)
 /// declared in type `type_name`, to `to`: the C# declaration, references within
 /// the C#, and PowerShell static call sites `[type_name]::from`.
+///
+/// C# declarations are filtered by case-sensitive simple owner name (or the
+/// synthetic `-Name` owner of a member-definition block) and use the resolver's
+/// supported receivers only. All matching overloads are included. PowerShell
+/// static sites use ASCII-insensitive type/member comparisons, without binding
+/// receiver types or requiring a matching C# declaration; instance sites are
+/// omitted. Only stored literal member spans with nonempty Unicode
+/// alphanumeric/underscore names are edited, including keyword and digit-initial
+/// generic names. Parser-recognized comments/continuations around `::` are left
+/// untouched. Replacement validity and name collisions are not checked.
 pub fn rename_member(
     scope: &Node,
     src: &str,
@@ -103,7 +131,7 @@ fn ps_type_refs(scope: &Node, src: &str, from: &str, out: &mut Vec<Span>) {
                 NodeKind::BareWord(w) => w.as_str(),
                 _ => "",
             };
-            // Compared case-insensitively without allocating, since every
+            // Compared ignoring ASCII case without allocating, since every
             // command in the script reaches here but only these two matter.
             if cmd.eq_ignore_ascii_case("new-object") {
                 // `New-Object Logger` / `-TypeName 'Logger'`: the argument is
@@ -298,21 +326,26 @@ fn ps_static_member_refs(
     out: &mut Vec<Span>,
 ) {
     scope.walk(&mut |n| {
-        let (target, m, is_static) = match &n.kind {
+        let (target, m, member_span, is_static) = match &n.kind {
             NodeKind::MemberAccess {
                 target,
                 member,
+                member_span,
                 is_static,
-            } => (target, member, *is_static),
+            } => (target, member, *member_span, *is_static),
             NodeKind::InvokeMember {
                 target,
                 member,
+                member_span,
                 is_static,
                 ..
-            } => (target, member, *is_static),
+            } => (target, member, *member_span, *is_static),
             _ => return,
         };
-        if !is_static || !m.eq_ignore_ascii_case(member) {
+        let Some(member_span) = member_span else {
+            return;
+        };
+        if !is_static || !is_plain_member_name(m) || !m.eq_ignore_ascii_case(member) {
             return;
         }
         let NodeKind::TypeExpression(_) = &target.kind else {
@@ -326,17 +359,21 @@ fn ps_static_member_refs(
         if !type_text_matches(t_inner, type_name) {
             return;
         }
-        if let Some(s) = member_span_after(src, target.span.end, member) {
-            out.push(s);
-        }
+        out.push(member_span);
     });
+}
+
+// Generic tokens admit punctuation and escapes too; a stored token span alone
+// is not permission to rename those broader spellings.
+fn is_plain_member_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// The type argument of a `New-Object` call: the value of `-TypeName`, or the
 /// first positional argument.
 /// The value bound to a named command parameter: either the inline
 /// `-Name value` argument, or the element following `-Name` when the name
-/// stands alone. Matching is case-insensitive and exact (not prefix-based, so
+/// stands alone. Matching ignores ASCII case and is exact (not prefix-based, so
 /// `-Namespace` does not satisfy a request for `name`).
 fn named_parameter_value<'a>(elements: &'a [Node], param: &str) -> Option<&'a Node> {
     let mut i = 0;
@@ -398,7 +435,7 @@ fn new_object_type_arg(elements: &[Node]) -> Option<&Node> {
     None
 }
 
-/// Whether `prefix` is a non-empty case-insensitive prefix of `full`, without
+/// Whether `prefix` is a non-empty ASCII-insensitive prefix of `full`, without
 /// allocating. Lets an abbreviated parameter (`-Type`) match `-TypeName`.
 fn is_prefix_ignore_ascii_case(prefix: &str, full: &str) -> bool {
     !prefix.is_empty()
@@ -407,7 +444,7 @@ fn is_prefix_ignore_ascii_case(prefix: &str, full: &str) -> bool {
 }
 
 /// Whether a bracketed type text names `target` (whole, or by last segment),
-/// case-insensitively.
+/// ignoring ASCII case.
 fn type_text_matches(inner: &str, target: &str) -> bool {
     let t = inner.trim();
     t.eq_ignore_ascii_case(target)
@@ -416,11 +453,8 @@ fn type_text_matches(inner: &str, target: &str) -> bool {
             .is_some_and(|seg| seg.eq_ignore_ascii_case(target))
 }
 
-/// Span of the part of a (possibly dotted) type text that names `from`: the
-/// whole trimmed text if it matches, else its last segment. `start` is the byte
-/// offset of `text` in the file.
 /// Pushes a span for every whole-identifier occurrence of `from` inside a
-/// type-expression interior (case-insensitive). Identifier boundaries are
+/// type-expression interior (ignoring ASCII case). Identifier boundaries are
 /// respected, so `Logger` does not match inside `LoggerHelper`, and `.` is a
 /// namespace separator, so only the simple name (after the last `.`) of each
 /// dotted run is compared. This covers plain (`Logger`), array (`Logger[]`),
@@ -453,26 +487,6 @@ fn find_type_name_spans(text: &str, base: usize, from: &str, out: &mut Vec<Span>
             let s = run_start + dot;
             out.push(Span::new(base + s, base + s + name.len()));
         }
-    }
-}
-
-/// Scans from `offset` past separator/whitespace, then over an identifier; if
-/// that identifier matches `member` case-insensitively, returns its span.
-fn member_span_after(src: &str, offset: usize, member: &str) -> Option<Span> {
-    let b = src.as_bytes();
-    let n = b.len();
-    let mut i = offset.min(n);
-    while i < n && (b[i] == b':' || b[i] == b'.' || b[i].is_ascii_whitespace()) {
-        i += 1;
-    }
-    let start = i;
-    while i < n && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
-        i += 1;
-    }
-    if i > start && src[start..i].eq_ignore_ascii_case(member) {
-        Some(Span::new(start, i))
-    } else {
-        None
     }
 }
 
@@ -529,6 +543,213 @@ mod tests {
 
     const PS: &str = "Add-Type -TypeDefinition @'\npublic class Win32 {\n  [DllImport(\"user32.dll\")]\n  public static extern int MessageBox(IntPtr h, string t, string c, uint ty);\n}\n'@\n[Win32]::MessageBox(0, 'hi', 'title', 0)\n$inst = New-Object Win32\n[Win32]$casted = $inst\n";
 
+    // Exact edit sets keep the stored-span expansion bounded: only recognized
+    // plain static names change, never surrounding trivia or unrelated text.
+    macro_rules! member_rename_cases {
+        ($($name:ident: $src:expr, $owner:expr, $from:expr,
+            [$(($start:expr, $end:expr)),*], $expected:expr;)*) => {
+            $(
+                #[test]
+                fn $name() {
+                    let src = $src;
+                    let out = parse(src);
+                    let expected_edits = vec![$(
+                        TextEdit::replace(Span::new($start, $end), "Renamed")
+                    ),*];
+
+                    let edits = rename_member(&out.script, src, $owner, $from, "Renamed");
+
+                    assert_eq!(edits.len(), expected_edits.len(), "{src:?}");
+                    assert_eq!(edits, expected_edits, "{src:?}");
+                    assert_eq!(apply_edits(src, &edits), Ok($expected.into()), "{src:?}");
+                }
+            )*
+        };
+    }
+
+    member_rename_cases! {
+        rename_member_ascii_access_and_call_without_declaration_use_exact_syntax_edits:
+            "[T]::M\n[t]::m()\n$obj.M\n[Other]::M()\n# M\n'M'\n", "T", "M",
+            [(5, 6), (12, 13)],
+            "[T]::Renamed\n[t]::Renamed()\n$obj.M\n[Other]::M()\n# M\n'M'\n";
+        rename_member_csharp_declaration_and_static_sites_use_exact_edits:
+            "Add-Type -TypeDefinition 'class T { public static void M() {} }'\n[T]::M\n[T]::M()\n",
+            "T", "M", [(55, 56), (70, 71), (77, 78)],
+            "Add-Type -TypeDefinition 'class T { public static void Renamed() {} }'\n[T]::Renamed\n[T]::Renamed()\n";
+        rename_member_keyword_retains_current_edit:
+            "[T]::return", "T", "return", [(5, 11)], "[T]::Renamed";
+        rename_member_digit_initial_generic_retains_current_edit:
+            "[T]::9Lives", "T", "9Lives", [(5, 11)], "[T]::Renamed";
+        rename_member_ascii_alnum_underscore_retains_current_edit:
+            "[T]::_M2", "T", "_M2", [(5, 8)], "[T]::Renamed";
+        rename_member_whitespace_retains_current_edit:
+            "[T] \t:: \tM", "T", "M", [(9, 10)], "[T] \t:: \tRenamed";
+        rename_member_unicode_initial_uses_stored_span:
+            "[T]::猫", "T", "猫", [(5, 8)], "[T]::Renamed";
+        rename_member_mixed_unicode_alnum_underscore_uses_stored_span:
+            "[T]::M猫_2", "T", "M猫_2", [(5, 11)], "[T]::Renamed";
+        rename_member_digit_initial_unicode_generic_uses_stored_span:
+            "[T]::9猫_2", "T", "9猫_2", [(5, 11)], "[T]::Renamed";
+        rename_member_accented_name_uses_stored_span:
+            "[T]::Méthod", "T", "Méthod", [(5, 12)], "[T]::Renamed";
+        rename_member_unicode_call_uses_stored_span:
+            "[T]::猫()", "T", "猫", [(5, 8)], "[T]::Renamed()";
+        rename_member_comment_before_separator_uses_stored_span:
+            "[T]<# gap #>::M", "T", "M", [(14, 15)], "[T]<# gap #>::Renamed";
+        rename_member_comment_after_separator_uses_stored_span:
+            "[T]::<# gap #>M", "T", "M", [(14, 15)], "[T]::<# gap #>Renamed";
+        rename_member_continuation_before_separator_uses_stored_span:
+            "[T]`\n::M", "T", "M", [(7, 8)], "[T]`\n::Renamed";
+        rename_member_continuation_after_separator_uses_stored_span:
+            "[T]::`\nM", "T", "M", [(7, 8)], "[T]::`\nRenamed";
+        rename_member_line_comment_after_separator_uses_stored_span:
+            "[T]::# gap\nM", "T", "M", [(11, 12)], "[T]::# gap\nRenamed";
+        rename_member_instance_access_is_excluded:
+            "$obj.M", "T", "M", [], "$obj.M";
+        rename_member_wrong_static_receiver_is_excluded:
+            "[Other]::M", "T", "M", [], "[Other]::M";
+        rename_member_dynamic_variable_text_is_not_an_editable_name:
+            "[T]::$name", "T", "$name", [], "[T]::$name";
+        rename_member_quoted_name_keeps_current_recovery_noop:
+            "[T]::'M'", "T", "M", [], "[T]::'M'";
+        rename_member_missing_name_keeps_current_noop:
+            "[T]::", "T", "", [], "[T]::";
+        rename_member_number_token_keeps_current_noop:
+            "[T]::123", "T", "123", [], "[T]::123";
+        rename_member_punctuation_generic_keeps_current_noop:
+            "[T]::Foo-Bar", "T", "Foo-Bar", [], "[T]::Foo-Bar";
+        rename_member_combining_mark_generic_keeps_current_noop:
+            "[T]::e\u{301}", "T", "e\u{301}", [], "[T]::e\u{301}";
+        rename_member_unclosed_call_retains_current_recovered_edit:
+            "[T]::M(", "T", "M", [(5, 6)], "[T]::Renamed(";
+    }
+
+    member_rename_cases! {
+        rename_member_comment_before_separator_call_uses_stored_span:
+            "[T]<# M #>::M()", "T", "M", [(12, 13)], "[T]<# M #>::Renamed()";
+        rename_member_comment_after_separator_call_uses_stored_span:
+            "[T]::<# M #>M()", "T", "M", [(12, 13)], "[T]::<# M #>Renamed()";
+        rename_member_continuation_before_separator_call_uses_stored_span:
+            "[T]`\r\n::M()", "T", "M", [(8, 9)], "[T]`\r\n::Renamed()";
+        rename_member_continuation_after_separator_call_uses_stored_span:
+            "[T]::`\r\n猫()", "T", "猫", [(8, 11)], "[T]::`\r\nRenamed()";
+        rename_member_line_comment_after_separator_call_uses_stored_span:
+            "[T]::# M\r\nM()", "T", "M", [(10, 11)], "[T]::# M\r\nRenamed()";
+        rename_member_bom_unicode_prefix_access_and_call_preserve_byte_offsets:
+            "\u{feff}'猫';\r\n[T]::Méthod\n[T]::Méthod()", "T", "Méthod",
+            [(16, 23), (29, 36)],
+            "\u{feff}'猫';\r\n[T]::Renamed\n[T]::Renamed()";
+        rename_member_nested_double_interpolation_preserves_absolute_unicode_span:
+            "\u{feff}'猫';\r\n\"$(\"$([T]::猫())\")\"", "T", "猫", [(22, 25)],
+            "\u{feff}'猫';\r\n\"$(\"$([T]::Renamed())\")\"";
+        rename_member_nested_here_in_double_preserves_trivia_and_unicode_span:
+            "\"$(@\"\r\n$([T]::<# 猫 #>猫)\r\n\"@)\"", "T", "猫", [(23, 26)],
+            "\"$(@\"\r\n$([T]::<# 猫 #>Renamed)\r\n\"@)\"";
+        rename_member_nested_double_in_here_preserves_unicode_call_span:
+            "@\"\n$(\"$([T]::猫())\")\n\"@", "T", "猫", [(13, 16)],
+            "@\"\n$(\"$([T]::Renamed())\")\n\"@";
+        rename_member_repeated_unicode_sites_use_distinct_spans:
+            "[T]::猫;\"$([T]::猫) $([T]::猫())\"", "T", "猫",
+            [(5, 8), (17, 20), (29, 32)],
+            "[T]::Renamed;\"$([T]::Renamed) $([T]::Renamed())\"";
+        rename_member_unicode_name_still_ignores_only_ascii_case:
+            "[T]::MéTHOD\n[t]::méthod()", "T", "Méthod", [(5, 12), (18, 25)],
+            "[T]::Renamed\n[t]::Renamed()";
+        rename_member_unicode_alphanumeric_characters_are_plain_names:
+            "[T]::猫²_1()", "T", "猫²_1", [(5, 12)], "[T]::Renamed()";
+        rename_member_keyword_call_retains_current_edit:
+            "[T]::return()", "T", "return", [(5, 11)], "[T]::Renamed()";
+        rename_member_digit_initial_generic_call_retains_current_edit:
+            "[T]::9Lives()", "T", "9Lives", [(5, 11)], "[T]::Renamed()";
+        rename_member_ascii_underscore_call_retains_current_edit:
+            "[T]::_M2()", "T", "_M2", [(5, 8)], "[T]::Renamed()";
+        rename_member_unicode_wrong_type_and_instance_sites_are_excluded:
+            "[Other]::<# 猫 #>猫()\n$obj.猫\n$obj.猫()", "T", "猫", [],
+            "[Other]::<# 猫 #>猫()\n$obj.猫\n$obj.猫()";
+        rename_member_non_type_static_receiver_is_excluded:
+            "$type::猫()", "T", "猫", [], "$type::猫()";
+        rename_member_unicode_similar_names_are_excluded:
+            "[T]::猫Helper\n[T]::猫_2()", "T", "猫", [],
+            "[T]::猫Helper\n[T]::猫_2()";
+        rename_member_non_ascii_case_differences_are_excluded:
+            "[T]::MÉthod\n[T]::MÉTHOD()", "T", "Méthod", [],
+            "[T]::MÉthod\n[T]::MÉTHOD()";
+        rename_member_non_ascii_type_case_differences_are_excluded:
+            "[É]::猫\n[É]::猫()", "é", "猫", [], "[É]::猫\n[É]::猫()";
+        rename_member_normalization_differences_are_excluded:
+            "[T]::e\u{301}\n[T]::e\u{301}()", "T", "é", [],
+            "[T]::e\u{301}\n[T]::e\u{301}()";
+        rename_member_dynamic_call_text_is_excluded:
+            "[T]::$name()", "T", "$name", [], "[T]::$name()";
+        rename_member_missing_call_name_is_excluded:
+            "[T]::()", "T", "", [], "[T]::()";
+        rename_member_quoted_and_computed_calls_are_excluded:
+            "[T]::\"猫\"()\n[T]::('猫')", "T", "猫", [],
+            "[T]::\"猫\"()\n[T]::('猫')";
+        rename_member_number_call_token_is_excluded:
+            "[T]::123()", "T", "123", [], "[T]::123()";
+        rename_member_punctuation_call_generic_is_excluded:
+            "[T]::Foo-Bar()", "T", "Foo-Bar", [], "[T]::Foo-Bar()";
+        rename_member_escaped_access_and_call_names_are_excluded:
+            "[T]::M`x\n[T]::M`x()", "T", "M`x", [], "[T]::M`x\n[T]::M`x()";
+        rename_member_escaped_name_is_not_decoded:
+            "[T]::M`x\n[T]::M`x()", "T", "Mx", [], "[T]::M`x\n[T]::M`x()";
+        rename_member_combining_mark_call_is_excluded:
+            "[T]::e\u{301}()", "T", "e\u{301}", [], "[T]::e\u{301}()";
+        rename_member_non_alphanumeric_unicode_name_is_excluded:
+            "[T]::猫🦀()", "T", "猫🦀", [], "[T]::猫🦀()";
+        rename_member_mixed_csharp_and_powershell_preserves_comments_and_strings:
+            "Add-Type -TypeDefinition @'\nclass T { public static int 猫; // 猫\n/* 猫 */ string Text = \"猫\"; }\n'@\n# 猫\n'猫'\n[T]::<# 猫 #>猫\n[T]::`\n猫()\n",
+            "T", "猫", [(56, 59), (130, 133), (141, 144)],
+            "Add-Type -TypeDefinition @'\nclass T { public static int Renamed; // 猫\n/* 猫 */ string Text = \"猫\"; }\n'@\n# 猫\n'猫'\n[T]::<# 猫 #>Renamed\n[T]::`\nRenamed()\n";
+    }
+
+    // Publicly constructed nodes may deliberately have no editable literal.
+    // Source text that looks like a plain name must not become a fallback.
+    fn member_without_span(src: &str) -> Node {
+        let out = parse(src);
+        let mut member_node = None;
+        out.script.walk(&mut |node| {
+            if matches!(
+                node.kind,
+                NodeKind::MemberAccess { .. } | NodeKind::InvokeMember { .. }
+            ) {
+                member_node = Some(node.clone());
+            }
+        });
+        let mut node = member_node.expect("fixture contains a member node");
+        match &mut node.kind {
+            NodeKind::MemberAccess { member_span, .. }
+            | NodeKind::InvokeMember { member_span, .. } => *member_span = None,
+            _ => unreachable!("selected a member node above"),
+        }
+        node
+    }
+
+    #[test]
+    fn rename_member_access_without_stored_span_does_not_rescan_source() {
+        let src = "[T]::M";
+        let node = member_without_span(src);
+
+        let edits = rename_member(&node, src, "T", "M", "Renamed");
+
+        assert_eq!(edits.len(), 0);
+        assert_eq!(edits, vec![]);
+        assert_eq!(apply_edits(src, &edits), Ok("[T]::M".into()));
+    }
+
+    #[test]
+    fn rename_member_call_without_stored_span_does_not_rescan_source() {
+        let src = "[T]::M()";
+        let node = member_without_span(src);
+
+        let edits = rename_member(&node, src, "T", "M", "Renamed");
+
+        assert_eq!(edits.len(), 0);
+        assert_eq!(edits, vec![]);
+        assert_eq!(apply_edits(src, &edits), Ok("[T]::M()".into()));
+    }
+
     #[test]
     fn rename_type_updates_csharp_and_all_powershell_sites() {
         let out = parse(PS);
@@ -542,6 +763,99 @@ mod tests {
         assert!(result.contains("[NativeApi]$casted"));
         // No old type name remains.
         assert!(!result.contains("Win32"));
+    }
+
+    #[test]
+    fn rename_type_updates_embedded_base_declaration_header_and_powershell_use() {
+        let src = "Add-Type -TypeDefinition @'\nclass Base{}class Child:Base{}\n'@\n[Base]\n";
+
+        let out = parse(src);
+        let edits = rename_type(&out.script, src, "Base", "Root");
+        let result = apply_edits(src, &edits).unwrap();
+
+        assert_eq!(out.errors, vec![]);
+        assert_eq!(
+            edits,
+            vec![
+                TextEdit::replace(Span::new(34, 38), "Root"),
+                TextEdit::replace(Span::new(52, 56), "Root"),
+                TextEdit::replace(Span::new(63, 67), "Root"),
+            ]
+        );
+        assert_eq!(
+            result,
+            "Add-Type -TypeDefinition @'\nclass Root{}class Child:Root{}\n'@\n[Root]\n"
+        );
+    }
+
+    #[test]
+    fn rename_type_with_commented_base_header_leaves_csharp_comments_and_strings_untouched() {
+        let src = "Add-Type -TypeDefinition @'\nclass Base {}\n// Base\n/* Base */\nclass Child : /* Base */ // Base\nBase { string Text = \"Base\"; }\n'@\n[Base]\n";
+
+        let out = parse(src);
+        let edits = rename_type(&out.script, src, "Base", "Root");
+        let result = apply_edits(src, &edits).unwrap();
+
+        assert_eq!(out.errors, vec![]);
+        assert_eq!(
+            edits,
+            vec![
+                TextEdit::replace(Span::new(34, 38), "Root"),
+                TextEdit::replace(Span::new(94, 98), "Root"),
+                TextEdit::replace(Span::new(129, 133), "Root"),
+            ]
+        );
+        assert_eq!(
+            result,
+            "Add-Type -TypeDefinition @'\nclass Root {}\n// Base\n/* Base */\nclass Child : /* Base */ // Base\nRoot { string Text = \"Base\"; }\n'@\n[Root]\n"
+        );
+    }
+
+    #[test]
+    fn rename_type_with_base_header_leaves_similar_and_differently_cased_csharp_names_untouched() {
+        let src = "Add-Type -TypeDefinition @'\nclass Base{}class Child:Base{}class BaseHelper{}class BASE{}class Other:BASE{}\n'@\n[Base]\n[BaseHelper]\n";
+
+        let out = parse(src);
+        let edits = rename_type(&out.script, src, "Base", "Root");
+        let result = apply_edits(src, &edits).unwrap();
+
+        assert_eq!(out.errors, vec![]);
+        assert_eq!(
+            edits,
+            vec![
+                TextEdit::replace(Span::new(34, 38), "Root"),
+                TextEdit::replace(Span::new(52, 56), "Root"),
+                TextEdit::replace(Span::new(111, 115), "Root"),
+            ]
+        );
+        assert_eq!(
+            result,
+            "Add-Type -TypeDefinition @'\nclass Root{}class Child:Root{}class BaseHelper{}class BASE{}class Other:BASE{}\n'@\n[Root]\n[BaseHelper]\n"
+        );
+    }
+
+    #[test]
+    fn rename_type_with_unicode_before_embedded_base_preserves_original_file_byte_offsets() {
+        let src =
+            "# café 🦀\nAdd-Type -TypeDefinition @'\nclass Base{}class Child:Base{}\n'@\n[Base]\n";
+
+        let out = parse(src);
+        let edits = rename_type(&out.script, src, "Base", "Root");
+        let result = apply_edits(src, &edits).unwrap();
+
+        assert_eq!(out.errors, vec![]);
+        assert_eq!(
+            edits,
+            vec![
+                TextEdit::replace(Span::new(47, 51), "Root"),
+                TextEdit::replace(Span::new(65, 69), "Root"),
+                TextEdit::replace(Span::new(76, 80), "Root"),
+            ]
+        );
+        assert_eq!(
+            result,
+            "# café 🦀\nAdd-Type -TypeDefinition @'\nclass Root{}class Child:Root{}\n'@\n[Root]\n"
+        );
     }
 
     #[test]

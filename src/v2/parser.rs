@@ -11,13 +11,39 @@
 //! [`NodeKind::Error`] nodes where it cannot proceed, so a tree always comes
 //! back.
 //!
+//! # Add-Type source cache
+//!
+//! Inline C# extraction accepts eligible string literals directly or through a
+//! parser-local cache of plain, unscoped variable assignments. Recognized writes
+//! (`=`, `+=`, `-=`, `*=`, `/=`, `%=`, `??=`) invalidate that variable's entry
+//! after parsing the RHS, so an `Add-Type` on the RHS can still use the old entry.
+//! Prefix/postfix `++` and `--` on such a variable also invalidate its entry.
+//! Only `=` with an eligible string-literal RHS installs or restores an entry;
+//! writes to another variable leave it alone.
+//!
+//! Single-quoted strings and single-quoted here-strings are eligible. For
+//! double-quoted forms, eligibility conservatively rejects any unescaped `$`
+//! in the raw body; a backtick skips the next character. This does not rely on
+//! the interpolation-parts list, which does not cover every reference.
+//! Unknown variables and rejected strings do not supply confirmed C# metadata.
+//! Missing metadata is neither a safety verdict nor proof that `Add-Type` is
+//! absent or cannot execute.
+//!
+//! This is a bounded syntactic cache in linear parser traversal order, not
+//! scope, branch, function, or dataflow analysis. It does not track indirect
+//! writes or alternate runtime values. Extracted text remains the raw body
+//! with delimiters removed and its source span, not a fully decoded PowerShell
+//! runtime string or a general decoded-text-to-source map.
+//!
+//! # Example
+//!
 //! ```
 //! use poshtree::v2::parse;
 //! let out = poshtree::v2::parser::parse("Get-ChildItem -Path . | Sort-Object\n");
 //! assert!(out.errors.is_empty());
 //! ```
 
-use super::lexer::lex;
+use super::lexer::{lex, scan_subexpression_end, variable_reference_len};
 use super::span::{Span, TokenRange};
 use super::tokens::TokenKind as T;
 use super::tokens::{LexError, Token};
@@ -54,10 +80,17 @@ pub struct ParseOutput {
 /// This lexes internally. If you have already lexed `src` (to inspect tokens,
 /// reconstruct, or check lex errors), call [`parse_tokens`] instead to avoid
 /// lexing twice; either way the tokens come back on [`ParseOutput::tokens`].
+///
+/// Error spans use UTF-8 byte offsets into the original input, including any
+/// leading BOM bytes.
 pub fn parse(src: &str) -> ParseOutput {
+    parse_at_depth(src, 0)
+}
+
+fn parse_at_depth(src: &str, initial_depth: u32) -> ParseOutput {
     let lexed = lex(src);
     let lex_errors: Vec<ParseError> = lexed.errors.iter().map(ParseError::from_lex).collect();
-    let mut out = parse_tokens(src, lexed.tokens);
+    let mut out = parse_tokens_at_depth(src, lexed.tokens, initial_depth);
     if !lex_errors.is_empty() {
         // Lexer errors come first, ahead of the parser errors already in `out`.
         let mut errors = lex_errors;
@@ -89,12 +122,16 @@ pub fn parse(src: &str) -> ParseOutput {
 ///
 /// [`LexOutput::errors`]: super::lexer::LexOutput::errors
 pub fn parse_tokens(src: &str, tokens: Vec<Token>) -> ParseOutput {
+    parse_tokens_at_depth(src, tokens, 0)
+}
+
+fn parse_tokens_at_depth(src: &str, tokens: Vec<Token>, initial_depth: u32) -> ParseOutput {
     let mut parser = Parser {
         tokens,
         src,
         pos: 0,
         errors: Vec::new(),
-        depth: 0,
+        depth: initial_depth,
         in_command_argument: false,
         suppress_array_comma: false,
         overflowed: false,
@@ -115,7 +152,7 @@ impl ParseError {
     fn from_lex(e: &LexError) -> Self {
         ParseError {
             message: e.to_string(),
-            span: lex_error_span(e),
+            span: e.span,
         }
     }
 }
@@ -143,8 +180,10 @@ struct Parser<'a> {
     /// pathological nesting stays linear in the token count instead of letting
     /// a parent re-drive the parse of the levels beneath it.
     overflowed: bool,
-    /// `$plainvar = "literal"` assignments, for recovering inline C# handed to
-    /// `Add-Type` through a variable. Stores the body and its source span.
+    /// Eligible string bodies and source spans for plain, unscoped variables in
+    /// parser traversal order, keyed ASCII-case-insensitively. Recognized writes
+    /// invalidate entries; only eligible literal `=` assignments restore them.
+    /// Not a scope model.
     vars: std::collections::HashMap<String, (String, Span)>,
 }
 
@@ -493,8 +532,10 @@ impl Parser<'_> {
                 self.bump();
                 // The value may be a full statement (`$x = if (...) {...}`).
                 let value = self.parse_statement();
-                // Constant propagation: remember `$plainvar = "literal"` so a
-                // later `Add-Type $plainvar` can recover the inline C#.
+                // Keep the old value available to the RHS, then discard stale
+                // source before any later Add-Type command can use it.
+                self.invalidate_cached_variable(&expr);
+                // Only an eligible literal `=` can restore the syntactic source cache.
                 if op == "=" {
                     if let (
                         NodeKind::Variable(raw),
@@ -504,7 +545,8 @@ impl Parser<'_> {
                     ) = (&expr.kind, &value.kind)
                     {
                         let n = raw.trim_start_matches('$');
-                        if !n.contains(':') && !n.starts_with('{') {
+                        if !n.contains(':') && !n.starts_with('{') && is_constant_string(sv, *kind)
+                        {
                             self.vars.insert(
                                 n.to_ascii_lowercase(),
                                 (
@@ -531,6 +573,15 @@ impl Parser<'_> {
         let first = self.parse_command();
         let pipeline = self.collect_pipeline(first, start);
         self.finish_chain(pipeline, start)
+    }
+
+    fn invalidate_cached_variable(&mut self, node: &Node) {
+        if let NodeKind::Variable(raw) = &node.kind {
+            let n = raw.trim_start_matches('$');
+            if !n.contains(':') && !n.starts_with('{') {
+                self.vars.remove(&n.to_ascii_lowercase());
+            }
+        }
     }
 
     /// Collects `|`-separated elements into a [`NodeKind::Pipeline`] (a single
@@ -1652,6 +1703,9 @@ impl Parser<'_> {
                 let op = self.value().to_string();
                 self.bump();
                 let operand = self.parse_unary();
+                if matches!(op.as_str(), "++" | "--") {
+                    self.invalidate_cached_variable(&operand);
+                }
                 return self.make(
                     NodeKind::Unary {
                         op,
@@ -1701,20 +1755,24 @@ impl Parser<'_> {
             if self.at(T::Dot) || self.at(T::DoubleColon) || null_dot {
                 let is_static = self.at(T::DoubleColon);
                 self.bump();
-                let member = if matches!(self.kind(), T::Generic | T::Keyword | T::Variable) {
-                    let v = self.value().to_string();
-                    self.bump();
-                    v
-                } else {
-                    self.error("expected member name");
-                    String::new()
-                };
+                let (member, member_span) =
+                    if matches!(self.kind(), T::Generic | T::Keyword | T::Variable) {
+                        let v = self.value().to_string();
+                        let span = matches!(self.kind(), T::Generic | T::Keyword)
+                            .then_some(self.tokens[self.pos].span);
+                        self.bump();
+                        (v, span)
+                    } else {
+                        self.error("expected member name");
+                        (String::new(), None)
+                    };
                 if self.at(T::LParen) {
                     let args = self.parse_paren_args();
                     node = self.make(
                         NodeKind::InvokeMember {
                             target: Box::new(node),
                             member,
+                            member_span,
                             is_static,
                             args,
                         },
@@ -1726,6 +1784,7 @@ impl Parser<'_> {
                         NodeKind::MemberAccess {
                             target: Box::new(node),
                             member,
+                            member_span,
                             is_static,
                         },
                         start,
@@ -1747,6 +1806,7 @@ impl Parser<'_> {
             } else if self.at(T::Operator) && matches!(self.value(), "++" | "--") {
                 let op = self.value().to_string();
                 self.bump();
+                self.invalidate_cached_variable(&node);
                 node = self.make(
                     NodeKind::PostfixUnary {
                         op,
@@ -1881,7 +1941,7 @@ impl Parser<'_> {
             // input; real code never approaches this depth.
             if inner.contains('$') && self.depth < 64 {
                 let base = body_span(&value, kind, span).start;
-                extract_interpolations(inner, base, i)
+                extract_interpolations(inner, base, i, self.depth)
             } else {
                 Vec::new()
             }
@@ -2009,7 +2069,7 @@ fn strip_sigil(var: &str) -> String {
 }
 
 /// The body of a string, without its delimiters.
-fn string_inner(value: &str, kind: StringKind) -> &str {
+pub(super) fn string_inner(value: &str, kind: StringKind) -> &str {
     match kind {
         StringKind::Single => value
             .strip_prefix('\'')
@@ -2046,115 +2106,59 @@ fn strip_here_newlines(s: &str) -> &str {
         .unwrap_or(s)
 }
 
-/// Matches a PowerShell variable reference at the start of `chars` and returns
-/// how many characters it spans, mirroring v1's `VAR_REF`:
-/// `$` followed by `{...}`, a `name` (optionally `scope:name`), or one of
-/// `$_ $? $^ $$`.
-fn match_var_ref(chars: &[char]) -> Option<usize> {
-    if chars.first() != Some(&'$') || chars.len() < 2 {
-        return None;
-    }
-    let n = chars.len();
-    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    match chars[1] {
-        '{' => {
-            let mut k = 2;
-            while k < n && chars[k] != '}' {
-                k += 1;
-            }
-            if k < n {
-                Some(k + 1)
-            } else {
-                None
-            }
-        }
-        c if c.is_ascii_alphabetic() || c == '_' => {
-            let mut k = 2;
-            while k < n && is_word(chars[k]) {
-                k += 1;
-            }
-            if k + 1 < n
-                && chars[k] == ':'
-                && (chars[k + 1].is_ascii_alphabetic() || chars[k + 1] == '_')
-            {
-                k += 1; // ':'
-                while k < n && is_word(chars[k]) {
-                    k += 1;
-                }
-            }
-            Some(k)
-        }
-        '?' | '^' | '$' => Some(2),
-        _ => None,
-    }
-}
-
 /// Extracts interpolation nodes (`$var`, `${name}`, `$(...)`) from the body of
-/// an expandable string, mirroring v1. Parts share the string's span and an
-/// empty token range, since their bytes are owned by the string token.
-fn extract_interpolations(inner: &str, base: usize, idx: usize) -> Vec<Node> {
+/// an expandable string. Parts have source byte spans and an empty token range,
+/// since their bytes are owned by the string token.
+fn extract_interpolations(inner: &str, base: usize, idx: usize, enclosing_depth: u32) -> Vec<Node> {
     let range = TokenRange {
         first: idx,
         end: idx,
     };
-    let chars: Vec<char> = inner.chars().collect();
-    let n = chars.len();
-    // Byte offset within `inner` for each char index, with a sentinel at n, so
-    // a char range maps to an absolute source span via `base`.
-    let mut boff = Vec::with_capacity(n + 1);
-    {
-        let mut b = 0usize;
-        for c in &chars {
-            boff.push(b);
-            b += c.len_utf8();
-        }
-        boff.push(b);
-    }
-    let span_at = |a: usize, z: usize| Span::new(base + boff[a], base + boff[z]);
+    let n = inner.len();
+    let span_at = |a: usize, z: usize| Span::new(base + a, base + z);
     let mut parts = Vec::new();
     let mut i = 0;
     while i < n {
-        if chars[i] == '`' {
-            i += 2; // backtick escapes the next character
+        // Cursor positions are bytes; non-ASCII text and escaped characters
+        // advance by whole scalars so slicing stays on UTF-8 boundaries.
+        let c = inner[i..].chars().next().expect("i is within inner");
+        if c == '`' {
+            i += 1;
+            if let Some(escaped) = inner[i..].chars().next() {
+                i += escaped.len_utf8();
+            }
             continue;
         }
-        if chars[i] == '$' && i + 1 < n && chars[i + 1] == '(' {
-            let mut depth = 0usize;
-            let mut j = i + 1;
-            while j < n {
-                match chars[j] {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-            let sub_src: String = chars[i + 2..j.min(n)].iter().collect();
-            let mut script = parse(&sub_src).script;
-            // `parse` returns spans relative to `sub_src` (base 0). Lift them to
+        if inner[i..].starts_with("$(") {
+            let closed_end = scan_subexpression_end(&inner[i..]).map(|end| i + end);
+            let end = closed_end.unwrap_or(n);
+            // Strip only a confirmed root closer. An unclosed fragment keeps
+            // its exact available remainder, including any nested closer.
+            let body_end = closed_end.map_or(n, |end| end - 1);
+            let sub_src = &inner[i + 2..body_end];
+            // Boundary-probe and fragment diagnostics intentionally stay local,
+            // preserving the outer parser's existing error policy.
+            // Inherit nesting, but keep the cache and sticky overflow latch
+            // fragment-local so recovery cannot poison the enclosing parser.
+            let mut script = parse_at_depth(sub_src, enclosing_depth).script;
+            // Fragment spans are relative to `sub_src` (base 0). Lift them to
             // absolute source offsets: `sub_src` begins at the byte after `$(`,
-            // i.e. `base + boff[i + 2]`. Without this, a variable inside the
+            // i.e. `base + i + 2`. Without this, a variable inside the
             // sub-expression keeps a sub_src-relative span and points at the
             // wrong bytes (or, worse, at coincidentally matching ones).
-            let delta = base + boff[i + 2];
+            let delta = base + i + 2;
             rebase(&mut script, delta, range);
-            let end = (j + 1).min(n);
             parts.push(Node {
                 kind: NodeKind::SubExpression(Box::new(script)),
                 span: span_at(i, end),
                 range,
             });
-            i = j + 1;
+            i = end;
             continue;
         }
-        if chars[i] == '$' {
-            if let Some(consumed) = match_var_ref(&chars[i..]) {
-                let raw: String = chars[i..i + consumed].iter().collect();
+        if c == '$' {
+            if let Some(consumed) = variable_reference_len(&inner[i..]) {
+                let raw = inner[i..i + consumed].to_string();
                 parts.push(Node {
                     kind: NodeKind::Variable(raw),
                     span: span_at(i, i + consumed),
@@ -2164,7 +2168,7 @@ fn extract_interpolations(inner: &str, base: usize, idx: usize) -> Vec<Node> {
                 continue;
             }
         }
-        i += 1;
+        i += c.len_utf8();
     }
     parts
 }
@@ -2214,13 +2218,23 @@ fn unwrap_single_expression(node: Node) -> Option<Node> {
 fn rebase(node: &mut Node, delta: usize, range: TokenRange) {
     node.span = Span::new(node.span.start + delta, node.span.end + delta);
     node.range = range;
+    match &mut node.kind {
+        NodeKind::MemberAccess { member_span, .. } | NodeKind::InvokeMember { member_span, .. } => {
+            if let Some(span) = member_span {
+                // Like the containing node, lift once per detached fragment;
+                // nested fragments have already been lifted into this one.
+                *span = Span::new(span.start + delta, span.end + delta);
+            }
+        }
+        _ => {}
+    }
     node.for_each_child_mut(&mut |child| rebase(child, delta, range));
 }
 
 /// Source span of a string's body (what [`string_inner`] returns) given the
 /// token's full span, so interpolation parts and Add-Type C# get spans that
 /// point at the real bytes rather than the whole string token.
-fn body_span(value: &str, kind: StringKind, span: Span) -> Span {
+pub(super) fn body_span(value: &str, kind: StringKind, span: Span) -> Span {
     let inner = string_inner(value, kind);
     let off = subslice_offset(value, inner);
     Span::new(span.start + off, span.start + off + inner.len())
@@ -2239,10 +2253,6 @@ fn strip_param_dash(param: &str) -> String {
         .to_string()
 }
 
-fn lex_error_span(_e: &LexError) -> Span {
-    Span::new(0, 0)
-}
-
 // Add-Type C# extraction (hand-rolled, dependency-free)
 
 use std::collections::HashMap;
@@ -2253,7 +2263,8 @@ use super::ast::{CSharpImport, CSharpMemberDef};
 
 /// Locates the C# source handed to `Add-Type`: the argument of a
 /// `-TypeDefinition`/`-MemberDefinition` parameter (prefix-matched), or the
-/// first positional string or resolvable variable. Returns `(code, label)`.
+/// first positional eligible literal or variable with a current source-cache
+/// entry. See the module's bounded cache contract. Returns `(code, label, span)`.
 fn find_csharp_code(
     elements: &[Node],
     vars: &HashMap<String, (String, Span)>,
@@ -2286,11 +2297,30 @@ fn find_csharp_code(
     None
 }
 
-/// A string literal's body (with its source span), or an unscoped variable
-/// resolved to the string it was assigned earlier in the script.
+pub(super) fn is_constant_string(value: &str, kind: StringKind) -> bool {
+    if matches!(kind, StringKind::Single | StringKind::HereSingle) {
+        return true;
+    }
+    // Interpolation parts do not cover every reference. Check raw spelling so
+    // escaped dollars and escaped backticks remain distinguishable.
+    let mut chars = string_inner(value, kind).chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => {
+                chars.next();
+            }
+            '$' => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// An eligible literal's raw body and source span, or an unscoped variable's
+/// current cached body/span. This does not evaluate or decode runtime strings.
 fn as_csharp_code(node: &Node, vars: &HashMap<String, (String, Span)>) -> Option<(String, Span)> {
     match &node.kind {
-        NodeKind::StringLiteral { value, kind, .. } => Some((
+        NodeKind::StringLiteral { value, kind, .. } if is_constant_string(value, *kind) => Some((
             string_inner(value, *kind).to_string(),
             body_span(value, *kind, node.span),
         )),
@@ -2630,6 +2660,109 @@ mod tests {
     }
 
     #[test]
+    fn parse_lex_errors_after_statement_keep_block_comment_span() {
+        let src = "1; <# x";
+        let expected = vec![ParseError {
+            message: "unterminated block comment at 3..7".into(),
+            span: Span::new(3, 7),
+        }];
+
+        let out = parse(src);
+
+        assert_eq!(out.errors, expected);
+    }
+
+    #[test]
+    fn parse_lex_errors_with_unicode_keep_utf8_byte_span() {
+        let src = "'ż'; <# 🦀";
+        let expected = vec![ParseError {
+            message: "unterminated block comment at 6..13".into(),
+            span: Span::new(6, 13),
+        }];
+
+        let out = parse(src);
+
+        assert_eq!(out.errors, expected);
+    }
+
+    #[test]
+    fn parse_lex_errors_with_bom_keep_original_utf8_byte_span() {
+        let src = "\u{feff}'ż'; <# 🦀";
+        let expected = vec![ParseError {
+            message: "unterminated block comment at 9..16".into(),
+            span: Span::new(9, 16),
+        }];
+
+        let out = parse(src);
+
+        assert_eq!(out.errors, expected);
+    }
+
+    #[test]
+    fn parse_lex_errors_at_source_start_keep_nonempty_span() {
+        let src = "<#";
+        let expected = vec![ParseError {
+            message: "unterminated block comment at 0..2".into(),
+            span: Span::new(0, 2),
+        }];
+
+        let out = parse(src);
+
+        assert_eq!(out.errors, expected);
+    }
+
+    #[test]
+    fn parse_lex_errors_in_unterminated_string_keep_token_span() {
+        let src = "1; 'open";
+        let expected = vec![ParseError {
+            message: "unterminated string at 3..8".into(),
+            span: Span::new(3, 8),
+        }];
+
+        let out = parse(src);
+
+        assert_eq!(out.errors, expected);
+    }
+
+    #[test]
+    fn parse_lex_errors_with_multiple_diagnostics_keep_spans_and_order() {
+        let src = "0x; <# x";
+        let expected = vec![
+            ParseError {
+                message: "radix prefix with no digits at 0..2".into(),
+                span: Span::new(0, 2),
+            },
+            ParseError {
+                message: "unterminated block comment at 4..8".into(),
+                span: Span::new(4, 8),
+            },
+        ];
+
+        let out = parse(src);
+
+        assert_eq!(out.errors, expected);
+    }
+
+    #[test]
+    fn parse_lex_errors_before_parser_errors_keep_spans_and_order() {
+        let src = "param( <# x";
+        let expected = vec![
+            ParseError {
+                message: "unterminated block comment at 7..11".into(),
+                span: Span::new(7, 11),
+            },
+            ParseError {
+                message: "expected ')'".into(),
+                span: Span::new(11, 11),
+            },
+        ];
+
+        let out = parse(src);
+
+        assert_eq!(out.errors, expected);
+    }
+
+    #[test]
     fn parses_a_simple_pipeline() {
         let root = clean("Get-ChildItem -Path . -Recurse | Sort-Object Length\n");
         assert_eq!(root.label(), "ScriptBlock");
@@ -2685,6 +2818,417 @@ mod tests {
         clean("$a[0]\n");
         clean("[System.Math]::Max(1, 2)\n");
         clean("$obj.Method($arg).Property\n");
+    }
+
+    // These cases check the public syntax tree, tokens, and diagnostics against
+    // explicit expectations, without a second parser or a source rescan.
+    macro_rules! member_parse_cases {
+        ($($name:ident: $src:expr,
+            ($label:expr, $member:expr, $static:expr, $end:expr, $range_end:expr,
+             $target_end:expr, $args:expr),
+            ($token_index:expr, $token_kind:ident, $token_text:expr, $ts:expr, $te:expr),
+            [$(($error:expr, $es:expr, $ee:expr)),*];)*) => {
+            $(
+                #[test]
+                fn $name() {
+                    let src = $src;
+                    let expected_errors = vec![$(ParseError {
+                        message: $error.into(),
+                        span: Span::new($es, $ee),
+                    }),*];
+
+                    let out = parse(src);
+
+                    let mut sites = Vec::new();
+                    out.script.walk(&mut |node| {
+                        let (target, member, is_static, args) = match &node.kind {
+                            NodeKind::MemberAccess { target, member, is_static, .. } =>
+                                (target, member, *is_static, None),
+                            NodeKind::InvokeMember { target, member, is_static, args, .. } =>
+                                (target, member, *is_static, Some(args.len())),
+                            _ => return,
+                        };
+                        sites.push((
+                            node.label(), member.clone(), is_static, node.span,
+                            node.range, target.span, args,
+                        ));
+                    });
+                    assert_eq!(out.errors, expected_errors, "{src:?}");
+                    assert_eq!(sites, vec![(
+                        $label, $member.to_string(), $static, Span::new(0, $end),
+                        TokenRange { first: 0, end: $range_end },
+                        Span::new(0, $target_end), $args,
+                    )], "{src:?}");
+                    let token = &out.tokens[$token_index];
+                    assert_eq!(
+                        (token.kind, token.value.as_str(), token.span),
+                        (T::$token_kind, $token_text, Span::new($ts, $te)),
+                        "{src:?}",
+                    );
+                }
+            )*
+        };
+    }
+
+    member_parse_cases! {
+        parse_static_ascii_access_keeps_member_and_ranges: "[T]::M",
+            ("MemberAccess", "M", true, 6, 5, 3, None),
+            (4, Generic, "M", 5, 6), [];
+        parse_static_ascii_call_keeps_member_and_empty_args: "[T]::M()",
+            ("InvokeMember", "M", true, 8, 7, 3, Some(0)),
+            (4, Generic, "M", 5, 6), [];
+        parse_static_keyword_member_retains_keyword_acceptance: "[T]::return",
+            ("MemberAccess", "return", true, 11, 5, 3, None),
+            (4, Keyword, "return", 5, 11), [];
+        parse_static_digit_initial_generic_retains_acceptance: "[T]::9Lives",
+            ("MemberAccess", "9Lives", true, 11, 5, 3, None),
+            (4, Generic, "9Lives", 5, 11), [];
+        parse_static_ascii_alnum_underscore_keeps_literal_member: "[T]::_M2",
+            ("MemberAccess", "_M2", true, 8, 5, 3, None),
+            (4, Generic, "_M2", 5, 8), [];
+        parse_static_digit_initial_unicode_generic_keeps_raw_member: "[T]::9猫_2",
+            ("MemberAccess", "9猫_2", true, 11, 5, 3, None),
+            (4, Generic, "9猫_2", 5, 11), [];
+        parse_static_unicode_initial_keeps_raw_member_and_byte_span: "[T]::猫",
+            ("MemberAccess", "猫", true, 8, 5, 3, None),
+            (4, Generic, "猫", 5, 8), [];
+        parse_static_unicode_call_keeps_raw_member_and_empty_args: "[T]::猫()",
+            ("InvokeMember", "猫", true, 10, 7, 3, Some(0)),
+            (4, Generic, "猫", 5, 8), [];
+        parse_static_mixed_unicode_alnum_underscore_keeps_raw_member: "[T]::M猫_2",
+            ("MemberAccess", "M猫_2", true, 11, 5, 3, None),
+            (4, Generic, "M猫_2", 5, 11), [];
+        parse_static_accented_member_keeps_raw_spelling: "[T]::Méthod",
+            ("MemberAccess", "Méthod", true, 12, 5, 3, None),
+            (4, Generic, "Méthod", 5, 12), [];
+        parse_static_punctuation_generic_retains_current_acceptance: "[T]::Foo-Bar",
+            ("MemberAccess", "Foo-Bar", true, 12, 5, 3, None),
+            (4, Generic, "Foo-Bar", 5, 12), [];
+        parse_static_combining_mark_keeps_unnormalized_generic: "[T]::e\u{301}",
+            ("MemberAccess", "e\u{301}", true, 8, 5, 3, None),
+            (4, Generic, "e\u{301}", 5, 8), [];
+        parse_static_whitespace_keeps_member_and_token_range: "[T] \t:: \tM",
+            ("MemberAccess", "M", true, 10, 5, 3, None),
+            (4, Generic, "M", 9, 10), [];
+        parse_static_comment_before_separator_keeps_member: "[T]<# gap #>::M",
+            ("MemberAccess", "M", true, 15, 5, 3, None),
+            (4, Generic, "M", 14, 15), [];
+        parse_static_comment_after_separator_keeps_member: "[T]::<# gap #>M",
+            ("MemberAccess", "M", true, 15, 5, 3, None),
+            (4, Generic, "M", 14, 15), [];
+        parse_static_continuation_before_separator_keeps_member: "[T]`\n::M",
+            ("MemberAccess", "M", true, 8, 5, 3, None),
+            (4, Generic, "M", 7, 8), [];
+        parse_static_continuation_after_separator_keeps_member: "[T]::`\nM",
+            ("MemberAccess", "M", true, 8, 5, 3, None),
+            (4, Generic, "M", 7, 8), [];
+        parse_static_line_comment_after_separator_retains_current_acceptance: "[T]::# gap\nM",
+            ("MemberAccess", "M", true, 12, 5, 3, None),
+            (4, Generic, "M", 11, 12), [];
+        parse_instance_access_keeps_nonstatic_flag: "$obj.M",
+            ("MemberAccess", "M", false, 6, 3, 4, None),
+            (2, Generic, "M", 5, 6), [];
+        parse_other_static_receiver_keeps_receiver_span: "[Other]::M",
+            ("MemberAccess", "M", true, 10, 5, 7, None),
+            (4, Generic, "M", 9, 10), [];
+        parse_dynamic_member_keeps_variable_text: "[T]::$name",
+            ("MemberAccess", "$name", true, 10, 5, 3, None),
+            (4, Variable, "$name", 5, 10), [];
+        parse_quoted_member_reports_error_and_keeps_empty_member: "[T]::'M'",
+            ("MemberAccess", "", true, 5, 4, 3, None),
+            (4, StringSq, "'M'", 5, 8), [("expected member name", 5, 8)];
+        parse_missing_member_reports_eof_and_keeps_empty_member: "[T]::",
+            ("MemberAccess", "", true, 5, 4, 3, None),
+            (4, Eof, "", 5, 5), [("expected member name", 5, 5)];
+        parse_number_member_remains_unaccepted: "[T]::123",
+            ("MemberAccess", "", true, 5, 4, 3, None),
+            (4, Number, "123", 5, 8), [("expected member name", 5, 8)];
+        parse_unclosed_member_call_keeps_recovered_call_and_diagnostic: "[T]::M(",
+            ("InvokeMember", "M", true, 7, 6, 3, Some(0)),
+            (4, Generic, "M", 5, 6), [("expected ')'", 7, 7)];
+    }
+
+    type MemberSpanShape = (
+        &'static str,
+        String,
+        bool,
+        Option<Span>,
+        Span,
+        TokenRange,
+        Span,
+        Option<usize>,
+    );
+    type DetachedSpanShape = (&'static str, Span, TokenRange);
+
+    fn assert_member_spans(
+        out: ParseOutput,
+        src: &str,
+        expected_members: Vec<MemberSpanShape>,
+        expected_detached: Vec<DetachedSpanShape>,
+        errors: Vec<ParseError>,
+    ) {
+        let mut members = Vec::new();
+        let mut detached = Vec::new();
+        out.script.walk(&mut |node| {
+            if node.range.is_empty() {
+                detached.push((node.label(), node.span, node.range));
+            }
+            let (target, member, member_span, is_static, args) = match &node.kind {
+                NodeKind::MemberAccess {
+                    target,
+                    member,
+                    member_span,
+                    is_static,
+                } => (target, member, *member_span, *is_static, None),
+                NodeKind::InvokeMember {
+                    target,
+                    member,
+                    member_span,
+                    is_static,
+                    args,
+                } => (target, member, *member_span, *is_static, Some(args.len())),
+                _ => return,
+            };
+            members.push((
+                node.label(),
+                member.clone(),
+                is_static,
+                member_span,
+                node.span,
+                node.range,
+                target.span,
+                args,
+            ));
+        });
+
+        assert_eq!(
+            (members, detached),
+            (expected_members, expected_detached),
+            "{src:?}"
+        );
+        assert_eq!(out.errors, errors, "{src:?}");
+        assert_eq!(crate::v2::reconstruct(&out.tokens), src);
+    }
+
+    // Both public entry points must expose literal original-input coordinates.
+    // Expected offsets are constants, never found by rescanning member text.
+    macro_rules! member_span_cases {
+        ($(($parse:ident, $tokens:ident): $src:expr,
+            [$(($label:expr, $member:expr, $static:expr, $member_span:expr,
+                ($start:expr, $end:expr), ($first:expr, $last:expr),
+                ($target_start:expr, $target_end:expr), $args:expr)),* $(,)?],
+            [$(($tag:expr, $ds:expr, $de:expr, $idx:expr)),* $(,)?],
+            [$(($error:expr, $es:expr, $ee:expr)),* $(,)?];)*) => {
+            $(
+                #[test]
+                fn $parse() {
+                    let src = $src;
+
+                    let out = parse(src);
+
+                    member_span_cases!(@assert out, src,
+                        [$(($label, $member, $static, $member_span,
+                            ($start, $end), ($first, $last),
+                            ($target_start, $target_end), $args)),*],
+                        [$(($tag, $ds, $de, $idx)),*],
+                        [$(($error, $es, $ee)),*]);
+                }
+
+                #[test]
+                fn $tokens() {
+                    let src = $src;
+                    let lexed = lex(src);
+
+                    let out = parse_tokens(src, lexed.tokens);
+
+                    member_span_cases!(@assert out, src,
+                        [$(($label, $member, $static, $member_span,
+                            ($start, $end), ($first, $last),
+                            ($target_start, $target_end), $args)),*],
+                        [$(($tag, $ds, $de, $idx)),*],
+                        [$(($error, $es, $ee)),*]);
+                }
+            )*
+        };
+        (@assert $out:expr, $src:expr,
+            [$(($label:expr, $member:expr, $static:expr, $member_span:expr,
+                ($start:expr, $end:expr), ($first:expr, $last:expr),
+                ($target_start:expr, $target_end:expr), $args:expr)),*],
+            [$(($tag:expr, $ds:expr, $de:expr, $idx:expr)),*],
+            [$(($error:expr, $es:expr, $ee:expr)),*]) => {
+            assert_member_spans($out, $src,
+                vec![$(($label, $member.into(), $static, $member_span,
+                    Span::new($start, $end), TokenRange { first: $first, end: $last },
+                    Span::new($target_start, $target_end), $args)),*],
+                vec![$(($tag, Span::new($ds, $de),
+                    TokenRange { first: $idx, end: $idx })),*],
+                vec![$(ParseError { message: $error.into(), span: Span::new($es, $ee) }),*]);
+        };
+    }
+
+    member_span_cases! {
+        (parse_member_span_static_access, parse_tokens_member_span_static_access): "[T]::M",
+            [("MemberAccess", "M", true, Some(Span::new(5, 6)), (0, 6), (0, 5), (0, 3), None)], [], [];
+        (parse_member_span_static_call, parse_tokens_member_span_static_call): "[T]::M()",
+            [("InvokeMember", "M", true, Some(Span::new(5, 6)), (0, 8), (0, 7), (0, 3), Some(0))], [], [];
+        (parse_member_span_instance_access, parse_tokens_member_span_instance_access): "$obj.M",
+            [("MemberAccess", "M", false, Some(Span::new(5, 6)), (0, 6), (0, 3), (0, 4), None)], [], [];
+        (parse_member_span_instance_call, parse_tokens_member_span_instance_call): "$obj.M()",
+            [("InvokeMember", "M", false, Some(Span::new(5, 6)), (0, 8), (0, 5), (0, 4), Some(0))], [], [];
+        (parse_member_span_static_keyword, parse_tokens_member_span_static_keyword): "[T]::return",
+            [("MemberAccess", "return", true, Some(Span::new(5, 11)), (0, 11), (0, 5), (0, 3), None)], [], [];
+        (parse_member_span_static_keyword_call, parse_tokens_member_span_static_keyword_call): "[T]::return()",
+            [("InvokeMember", "return", true, Some(Span::new(5, 11)), (0, 13), (0, 7), (0, 3), Some(0))], [], [];
+        (parse_member_span_instance_keyword, parse_tokens_member_span_instance_keyword): "$obj.return",
+            [("MemberAccess", "return", false, Some(Span::new(5, 11)), (0, 11), (0, 3), (0, 4), None)], [], [];
+        (parse_member_span_instance_keyword_call, parse_tokens_member_span_instance_keyword_call): "$obj.return()",
+            [("InvokeMember", "return", false, Some(Span::new(5, 11)), (0, 13), (0, 5), (0, 4), Some(0))], [], [];
+        (parse_member_span_unicode, parse_tokens_member_span_unicode): "[T]::猫",
+            [("MemberAccess", "猫", true, Some(Span::new(5, 8)), (0, 8), (0, 5), (0, 3), None)], [], [];
+        (parse_member_span_unicode_call, parse_tokens_member_span_unicode_call): "$obj.猫()",
+            [("InvokeMember", "猫", false, Some(Span::new(5, 8)), (0, 10), (0, 5), (0, 4), Some(0))], [], [];
+        (parse_member_span_digit_initial_unicode, parse_tokens_member_span_digit_initial_unicode): "[T]::9猫_2",
+            [("MemberAccess", "9猫_2", true, Some(Span::new(5, 11)), (0, 11), (0, 5), (0, 3), None)], [], [];
+        (parse_member_span_ascii_underscore, parse_tokens_member_span_ascii_underscore): "[T]::_M2",
+            [("MemberAccess", "_M2", true, Some(Span::new(5, 8)), (0, 8), (0, 5), (0, 3), None)], [], [];
+        (parse_member_span_broad_generic, parse_tokens_member_span_broad_generic): "[T]::Foo-Bar",
+            [("MemberAccess", "Foo-Bar", true, Some(Span::new(5, 12)), (0, 12), (0, 5), (0, 3), None)], [], [];
+        (parse_member_span_combining_mark, parse_tokens_member_span_combining_mark): "[T]::e\u{301}()",
+            [("InvokeMember", "e\u{301}", true, Some(Span::new(5, 8)), (0, 10), (0, 7), (0, 3), Some(0))], [], [];
+        (parse_member_span_bom_prefix_unicode_crlf, parse_tokens_member_span_bom_prefix_unicode_crlf):
+            "\u{feff}'猫';\r\n[T]::Méthod()",
+            [("InvokeMember", "Méthod", true, Some(Span::new(16, 23)), (11, 25), (2, 9), (11, 14), Some(0))], [], [];
+        (parse_member_span_instance_prefix_unicode_crlf, parse_tokens_member_span_instance_prefix_unicode_crlf):
+            "\"猫\";\r\n$obj.M猫_2()",
+            [("InvokeMember", "M猫_2", false, Some(Span::new(13, 19)), (8, 21), (2, 7), (8, 12), Some(0))], [], [];
+        (parse_member_span_whitespace, parse_tokens_member_span_whitespace): "[T] \t:: \tM",
+            [("MemberAccess", "M", true, Some(Span::new(9, 10)), (0, 10), (0, 5), (0, 3), None)], [], [];
+        (parse_member_span_comment_before, parse_tokens_member_span_comment_before): "[T]<# gap #>::M",
+            [("MemberAccess", "M", true, Some(Span::new(14, 15)), (0, 15), (0, 5), (0, 3), None)], [], [];
+        (parse_member_span_comment_after, parse_tokens_member_span_comment_after): "[T]::<# gap #>M",
+            [("MemberAccess", "M", true, Some(Span::new(14, 15)), (0, 15), (0, 5), (0, 3), None)], [], [];
+        (parse_member_span_continuation_before, parse_tokens_member_span_continuation_before): "[T]`\n::M",
+            [("MemberAccess", "M", true, Some(Span::new(7, 8)), (0, 8), (0, 5), (0, 3), None)], [], [];
+        (parse_member_span_continuation_after, parse_tokens_member_span_continuation_after): "[T]::`\nM",
+            [("MemberAccess", "M", true, Some(Span::new(7, 8)), (0, 8), (0, 5), (0, 3), None)], [], [];
+        (parse_member_span_crlf_continuation_call, parse_tokens_member_span_crlf_continuation_call): "[T]::`\r\n猫()",
+            [("InvokeMember", "猫", true, Some(Span::new(8, 11)), (0, 13), (0, 7), (0, 3), Some(0))], [], [];
+        (parse_member_span_line_comment, parse_tokens_member_span_line_comment): "[T]::# gap\nM",
+            [("MemberAccess", "M", true, Some(Span::new(11, 12)), (0, 12), (0, 5), (0, 3), None)], [], [];
+        (parse_member_span_variable_is_none, parse_tokens_member_span_variable_is_none): "[T]::$name",
+            [("MemberAccess", "$name", true, None, (0, 10), (0, 5), (0, 3), None)], [], [];
+        (parse_member_span_variable_call_is_none, parse_tokens_member_span_variable_call_is_none): "$obj.$name()",
+            [("InvokeMember", "$name", false, None, (0, 12), (0, 5), (0, 4), Some(0))], [], [];
+        (parse_member_span_missing_is_none, parse_tokens_member_span_missing_is_none): "[T]::",
+            [("MemberAccess", "", true, None, (0, 5), (0, 4), (0, 3), None)],
+            [], [("expected member name", 5, 5)];
+        (parse_member_span_single_quoted_is_none, parse_tokens_member_span_single_quoted_is_none): "[T]::'M'",
+            [("MemberAccess", "", true, None, (0, 5), (0, 4), (0, 3), None)],
+            [], [("expected member name", 5, 8)];
+        (parse_member_span_double_quoted_is_none, parse_tokens_member_span_double_quoted_is_none): "[T]::\"M\"",
+            [("MemberAccess", "", true, None, (0, 5), (0, 4), (0, 3), None)],
+            [], [("expected member name", 5, 8)];
+        (parse_member_span_computed_is_none, parse_tokens_member_span_computed_is_none): "[T]::('M')",
+            [("InvokeMember", "", true, None, (0, 10), (0, 7), (0, 3), Some(1))],
+            [], [("expected member name", 5, 6)];
+        (parse_member_span_number_is_none, parse_tokens_member_span_number_is_none): "[T]::123",
+            [("MemberAccess", "", true, None, (0, 5), (0, 4), (0, 3), None)],
+            [], [("expected member name", 5, 8)];
+        (parse_member_span_incomplete_call_keeps_name, parse_tokens_member_span_incomplete_call_keeps_name): "[T]::M(",
+            [("InvokeMember", "M", true, Some(Span::new(5, 6)), (0, 7), (0, 6), (0, 3), Some(0))],
+            [], [("expected ')'", 7, 7)];
+        (parse_member_span_incomplete_args_keep_name, parse_tokens_member_span_incomplete_args_keep_name): "[T]::M(1",
+            [("InvokeMember", "M", true, Some(Span::new(5, 6)), (0, 8), (0, 7), (0, 3), Some(1))],
+            [], [("expected ')'", 8, 8)];
+        (parse_member_span_incomplete_unicode_call_keeps_name, parse_tokens_member_span_incomplete_unicode_call_keeps_name): "$obj.猫(",
+            [("InvokeMember", "猫", false, Some(Span::new(5, 8)), (0, 9), (0, 4), (0, 4), Some(0))],
+            [], [("expected ')'", 9, 9)];
+    }
+
+    member_span_cases! {
+        (parse_member_span_double_fragment, parse_tokens_member_span_double_fragment): r#""$([T]::M)""#,
+            [("MemberAccess", "M", true, Some(Span::new(8, 9)), (3, 9), (0, 0), (3, 6), None)],
+            [("SubExpression", 1, 10, 0), ("ScriptBlock", 3, 9, 0),
+             ("MemberAccess", 3, 9, 0), ("TypeExpression", 3, 6, 0)], [];
+        (parse_member_span_unicode_fragment_call, parse_tokens_member_span_unicode_fragment_call): r#""é $([T]::猫())""#,
+            [("InvokeMember", "猫", true, Some(Span::new(11, 14)), (6, 16), (0, 0), (6, 9), Some(0))],
+            [("SubExpression", 4, 17, 0), ("ScriptBlock", 6, 16, 0),
+             ("InvokeMember", 6, 16, 0), ("TypeExpression", 6, 9, 0)], [];
+        (parse_member_span_here_fragment_crlf, parse_tokens_member_span_here_fragment_crlf): "@\"\r\n猫 $($obj.M)\r\n\"@",
+            [("MemberAccess", "M", false, Some(Span::new(15, 16)), (10, 16), (0, 0), (10, 14), None)],
+            [("SubExpression", 8, 17, 0), ("ScriptBlock", 10, 16, 0),
+             ("MemberAccess", 10, 16, 0), ("Variable", 10, 14, 0)], [];
+        (parse_member_span_repeated_names_are_distinct, parse_tokens_member_span_repeated_names_are_distinct):
+            r#"[T]::M;"$([T]::M) $([T]::M())""#,
+            [("MemberAccess", "M", true, Some(Span::new(5, 6)), (0, 6), (0, 5), (0, 3), None),
+             ("MemberAccess", "M", true, Some(Span::new(15, 16)), (10, 16), (6, 6), (10, 13), None),
+             ("InvokeMember", "M", true, Some(Span::new(25, 26)), (20, 28), (6, 6), (20, 23), Some(0))],
+            [("SubExpression", 8, 17, 6), ("ScriptBlock", 10, 16, 6),
+             ("MemberAccess", 10, 16, 6), ("TypeExpression", 10, 13, 6),
+             ("SubExpression", 18, 29, 6), ("ScriptBlock", 20, 28, 6),
+             ("InvokeMember", 20, 28, 6), ("TypeExpression", 20, 23, 6)], [];
+        (parse_member_span_nested_double_bom, parse_tokens_member_span_nested_double_bom):
+            "\u{feff}'猫';\r\n\"$(\"$([T]::猫())\")\"",
+            [("InvokeMember", "猫", true, Some(Span::new(22, 25)), (17, 27), (2, 2), (17, 20), Some(0))],
+            [("SubExpression", 12, 30, 2), ("ScriptBlock", 14, 29, 2),
+             ("StringLiteral", 14, 29, 2), ("SubExpression", 15, 28, 2),
+             ("ScriptBlock", 17, 27, 2), ("InvokeMember", 17, 27, 2),
+             ("TypeExpression", 17, 20, 2)], [];
+        (parse_member_span_nested_here_in_double, parse_tokens_member_span_nested_here_in_double):
+            "\"$(@\"\r\n$([T]::M)\r\n\"@)\"",
+            [("MemberAccess", "M", true, Some(Span::new(14, 15)), (9, 15), (0, 0), (9, 12), None)],
+            [("SubExpression", 1, 21, 0), ("ScriptBlock", 3, 20, 0),
+             ("StringLiteral", 3, 20, 0), ("SubExpression", 7, 16, 0),
+             ("ScriptBlock", 9, 15, 0), ("MemberAccess", 9, 15, 0),
+             ("TypeExpression", 9, 12, 0)], [];
+        (parse_member_span_nested_double_in_here, parse_tokens_member_span_nested_double_in_here):
+            "@\"\n$(\"$($obj.M())\")\n\"@",
+            [("InvokeMember", "M", false, Some(Span::new(13, 14)), (8, 16), (0, 0), (8, 12), Some(0))],
+            [("SubExpression", 3, 19, 0), ("ScriptBlock", 5, 18, 0),
+             ("StringLiteral", 5, 18, 0), ("SubExpression", 6, 17, 0),
+             ("ScriptBlock", 8, 16, 0), ("InvokeMember", 8, 16, 0),
+             ("Variable", 8, 12, 0)], [];
+        (parse_member_span_empty_fragment_keeps_ranges, parse_tokens_member_span_empty_fragment_keeps_ranges):
+            r#""$() $([T]::M)""#,
+            [("MemberAccess", "M", true, Some(Span::new(12, 13)), (7, 13), (0, 0), (7, 10), None)],
+            [("SubExpression", 1, 4, 0), ("ScriptBlock", 3, 3, 0),
+             ("SubExpression", 5, 14, 0), ("ScriptBlock", 7, 13, 0),
+             ("MemberAccess", 7, 13, 0), ("TypeExpression", 7, 10, 0)], [];
+        (parse_member_span_nested_normal_fragment, parse_tokens_member_span_nested_normal_fragment):
+            r#""$($([T]::M))""#,
+            [("MemberAccess", "M", true, Some(Span::new(10, 11)), (5, 11), (0, 0), (5, 8), None)],
+            [("SubExpression", 1, 13, 0), ("ScriptBlock", 3, 12, 0),
+             ("SubExpression", 3, 12, 0), ("ScriptBlock", 5, 11, 0),
+             ("MemberAccess", 5, 11, 0), ("TypeExpression", 5, 8, 0)], [];
+        (parse_member_span_chained_fragment_names_rebase_once, parse_tokens_member_span_chained_fragment_names_rebase_once):
+            r#""$($obj.M().M)""#,
+            [("MemberAccess", "M", false, Some(Span::new(12, 13)), (3, 13), (0, 0), (3, 11), None),
+             ("InvokeMember", "M", false, Some(Span::new(8, 9)), (3, 11), (0, 0), (3, 7), Some(0))],
+            [("SubExpression", 1, 14, 0), ("ScriptBlock", 3, 13, 0),
+             ("MemberAccess", 3, 13, 0), ("InvokeMember", 3, 11, 0),
+             ("Variable", 3, 7, 0)], [];
+        (parse_member_span_fragment_variable_stays_none, parse_tokens_member_span_fragment_variable_stays_none):
+            r#""$([T]::$name)""#,
+            [("MemberAccess", "$name", true, None, (3, 13), (0, 0), (3, 6), None)],
+            [("SubExpression", 1, 14, 0), ("ScriptBlock", 3, 13, 0),
+             ("MemberAccess", 3, 13, 0), ("TypeExpression", 3, 6, 0)], [];
+        (parse_member_span_fragment_missing_stays_none, parse_tokens_member_span_fragment_missing_stays_none):
+            r#""$([T]::)""#,
+            [("MemberAccess", "", true, None, (3, 8), (0, 0), (3, 6), None)],
+            [("SubExpression", 1, 9, 0), ("ScriptBlock", 3, 8, 0),
+             ("MemberAccess", 3, 8, 0), ("TypeExpression", 3, 6, 0)], [];
+        (parse_member_span_fragment_quoted_stays_none, parse_tokens_member_span_fragment_quoted_stays_none):
+            r#""$([T]::'M')""#,
+            [("MemberAccess", "", true, None, (3, 8), (0, 0), (3, 6), None)],
+            [("SubExpression", 1, 12, 0), ("ScriptBlock", 3, 11, 0),
+             ("MemberAccess", 3, 8, 0), ("TypeExpression", 3, 6, 0),
+             ("StringLiteral", 8, 11, 0)], [];
+        (parse_member_span_fragment_computed_stays_none, parse_tokens_member_span_fragment_computed_stays_none):
+            r#""$([T]::('M'))""#,
+            [("InvokeMember", "", true, None, (3, 13), (0, 0), (3, 6), Some(1))],
+            [("SubExpression", 1, 14, 0), ("ScriptBlock", 3, 13, 0),
+             ("InvokeMember", 3, 13, 0), ("TypeExpression", 3, 6, 0),
+             ("StringLiteral", 9, 12, 0)], [];
     }
 
     #[test]
@@ -2793,6 +3337,586 @@ mod tests {
         });
     }
 
+    // Compare the public tree's raw payloads and coordinates, not fragment-local
+    // tokens. Every descendant of an interpolation belongs to the outer token.
+    fn interpolation_shape(node: &Node) -> (&'static str, String, Span, TokenRange) {
+        let (tag, raw) = match &node.kind {
+            NodeKind::Script(_) => ("script", ""),
+            NodeKind::SubExpression(_) => ("sub", ""),
+            NodeKind::StringLiteral { kind, value, .. } => (
+                match kind {
+                    StringKind::Single => "single",
+                    StringKind::Double => "double",
+                    StringKind::HereSingle => "here-single",
+                    StringKind::HereDouble => "here-double",
+                },
+                value.as_str(),
+            ),
+            NodeKind::Variable(raw) => ("variable", raw.as_str()),
+            NodeKind::Number(raw) => ("number", raw.as_str()),
+            NodeKind::Binary { op, .. } => ("binary", op.as_str()),
+            NodeKind::BareWord(raw) => ("bareword", raw.as_str()),
+            NodeKind::Command { .. } => ("command", ""),
+            NodeKind::Error(raw) => ("error", raw.as_str()),
+            other => panic!("unexpected interpolation regression node: {other:?}"),
+        };
+        (tag, raw.into(), node.span, node.range)
+    }
+
+    macro_rules! subexpression_boundary_cases {
+        ($(($parse:ident, $tokens:ident): $src:literal,
+            [$(($tag:literal, $raw:literal, $start:literal, $end:literal,
+                $first:literal, $last:literal)),* $(,)?],
+            [$(($message:literal, $err_start:literal, $err_end:literal)),* $(,)?];)*) => {
+            $(
+                #[test]
+                fn $parse() {
+                    let src = $src;
+
+                    let out = parse(src);
+
+                    assert_subexpression_boundary(out, src,
+                        vec![$(($tag, $raw.into(), Span::new($start, $end),
+                            TokenRange { first: $first, end: $last })),*],
+                        vec![$(ParseError { message: $message.into(),
+                            span: Span::new($err_start, $err_end) }),*]);
+                }
+
+                #[test]
+                fn $tokens() {
+                    let src = $src;
+                    let lexed = lex(src);
+
+                    let out = parse_tokens(src, lexed.tokens);
+
+                    // parse_tokens does not import lexer errors; neither entry
+                    // point imports boundary-probe or fragment diagnostics.
+                    assert_subexpression_boundary(out, src,
+                        vec![$(($tag, $raw.into(), Span::new($start, $end),
+                            TokenRange { first: $first, end: $last })),*],
+                        vec![]);
+                }
+            )*
+        };
+    }
+
+    fn assert_subexpression_boundary(
+        out: ParseOutput,
+        src: &str,
+        expected: Vec<(&'static str, String, Span, TokenRange)>,
+        errors: Vec<ParseError>,
+    ) {
+        let NodeKind::Script(statements) = &out.script.kind else {
+            panic!("expected script, got {:?}", out.script);
+        };
+        let actual: Vec<_> = statements
+            .iter()
+            .flat_map(|statement| {
+                let mut shapes = Vec::new();
+                statement.walk(&mut |node| shapes.push(interpolation_shape(node)));
+                shapes
+            })
+            .collect();
+
+        assert_eq!(actual, expected);
+        assert_eq!(out.errors, errors);
+        assert_eq!(crate::v2::reconstruct(&out.tokens), src);
+    }
+
+    subexpression_boundary_cases! {
+        (parse_boundary_single_quote, parse_tokens_boundary_single_quote):
+            r#""$(')') $tail";42"#, [
+                ("double", r#""$(')') $tail""#, 0, 14, 0, 1),
+                ("sub", "", 1, 7, 0, 0),
+                ("script", "", 3, 6, 0, 0),
+                ("single", "')'", 3, 6, 0, 0),
+                ("variable", "$tail", 8, 13, 0, 0),
+                ("number", "42", 15, 17, 2, 3),
+            ], [];
+        (parse_boundary_double_quote, parse_tokens_boundary_double_quote):
+            r#""$("(") $tail";42"#, [
+                ("double", r#""$("(") $tail""#, 0, 14, 0, 1),
+                ("sub", "", 1, 7, 0, 0),
+                ("script", "", 3, 6, 0, 0),
+                ("double", r#""(""#, 3, 6, 0, 0),
+                ("variable", "$tail", 8, 13, 0, 0),
+                ("number", "42", 15, 17, 2, 3),
+            ], [];
+        (parse_boundary_doubled_single_quote, parse_tokens_boundary_doubled_single_quote):
+            r#""$('a'')(') $tail";42"#, [
+                ("double", r#""$('a'')(') $tail""#, 0, 18, 0, 1),
+                ("sub", "", 1, 11, 0, 0),
+                ("script", "", 3, 10, 0, 0),
+                ("single", "'a'')('", 3, 10, 0, 0),
+                ("variable", "$tail", 12, 17, 0, 0),
+                ("number", "42", 19, 21, 2, 3),
+            ], [];
+        (parse_boundary_doubled_double_quote, parse_tokens_boundary_doubled_double_quote):
+            r#""$("a"")(") $tail";42"#, [
+                ("double", r#""$("a"")(") $tail""#, 0, 18, 0, 1),
+                ("sub", "", 1, 11, 0, 0),
+                ("script", "", 3, 10, 0, 0),
+                ("double", r#""a"")(""#, 3, 10, 0, 0),
+                ("variable", "$tail", 12, 17, 0, 0),
+                ("number", "42", 19, 21, 2, 3),
+            ], [];
+        (parse_boundary_line_comment, parse_tokens_boundary_line_comment):
+            "\"$(1 # ) (\r\n; $é) $tail\";42", [
+                ("double", "\"$(1 # ) (\r\n; $é) $tail\"", 0, 25, 0, 1),
+                ("sub", "", 1, 18, 0, 0),
+                ("script", "", 3, 17, 0, 0),
+                ("number", "1", 3, 4, 0, 0),
+                ("variable", "$é", 14, 17, 0, 0),
+                ("variable", "$tail", 19, 24, 0, 0),
+                ("number", "42", 26, 28, 2, 3),
+            ], [];
+        (parse_boundary_block_comment_first_terminator, parse_tokens_boundary_block_comment_first_terminator):
+            "\"$(1 <# <# ) ( #> ; $é) $tail\";42", [
+                ("double", "\"$(1 <# <# ) ( #> ; $é) $tail\"", 0, 31, 0, 1),
+                ("sub", "", 1, 24, 0, 0),
+                ("script", "", 3, 23, 0, 0),
+                ("number", "1", 3, 4, 0, 0),
+                ("variable", "$é", 20, 23, 0, 0),
+                ("variable", "$tail", 25, 30, 0, 0),
+                ("number", "42", 32, 34, 2, 3),
+            ], [];
+        (parse_boundary_code_escape, parse_tokens_boundary_code_escape):
+            "\"$( `) ; $é) $tail\";42", [
+                ("double", "\"$( `) ; $é) $tail\"", 0, 20, 0, 1),
+                ("sub", "", 1, 13, 0, 0),
+                ("script", "", 4, 12, 0, 0),
+                ("command", "", 4, 6, 0, 0),
+                ("bareword", "`)", 4, 6, 0, 0),
+                ("variable", "$é", 9, 12, 0, 0),
+                ("variable", "$tail", 14, 19, 0, 0),
+                ("number", "42", 21, 23, 2, 3),
+            ], [];
+        (parse_boundary_single_here, parse_tokens_boundary_single_here):
+            "\"$(@'\n) (\n'@) $tail\";42", [
+                ("double", "\"$(@'\n) (\n'@) $tail\"", 0, 20, 0, 1),
+                ("sub", "", 1, 13, 0, 0),
+                ("script", "", 3, 12, 0, 0),
+                ("here-single", "@'\n) (\n'@", 3, 12, 0, 0),
+                ("variable", "$tail", 14, 19, 0, 0),
+                ("number", "42", 21, 23, 2, 3),
+            ], [];
+        (parse_boundary_double_here, parse_tokens_boundary_double_here):
+            "\"$(@\"\r\n) (\r\n\"@) $tail\";42", [
+                ("double", "\"$(@\"\r\n) (\r\n\"@) $tail\"", 0, 22, 0, 1),
+                ("sub", "", 1, 15, 0, 0),
+                ("script", "", 3, 14, 0, 0),
+                ("here-double", "@\"\r\n) (\r\n\"@", 3, 14, 0, 0),
+                ("variable", "$tail", 16, 21, 0, 0),
+                ("number", "42", 23, 25, 2, 3),
+            ], [];
+        (parse_boundary_here_crlf_unicode, parse_tokens_boundary_here_crlf_unicode):
+            "@\"\r\né $(')') $tail\r\n\"@;42", [
+                ("here-double", "@\"\r\né $(')') $tail\r\n\"@", 0, 23, 0, 1),
+                ("sub", "", 7, 13, 0, 0),
+                ("script", "", 9, 12, 0, 0),
+                ("single", "')'", 9, 12, 0, 0),
+                ("variable", "$tail", 14, 19, 0, 0),
+                ("number", "42", 24, 26, 2, 3),
+            ], [];
+        (parse_boundary_nested_expandable, parse_tokens_boundary_nested_expandable):
+            "\"$(\"$($é)\") $tail\";42", [
+                ("double", "\"$(\"$($é)\") $tail\"", 0, 19, 0, 1),
+                ("sub", "", 1, 12, 0, 0),
+                ("script", "", 3, 11, 0, 0),
+                ("double", "\"$($é)\"", 3, 11, 0, 0),
+                ("sub", "", 4, 10, 0, 0),
+                ("script", "", 6, 9, 0, 0),
+                ("variable", "$é", 6, 9, 0, 0),
+                ("variable", "$tail", 13, 18, 0, 0),
+                ("number", "42", 20, 22, 2, 3),
+            ], [];
+        (parse_boundary_empty, parse_tokens_boundary_empty):
+            "\"$()$tail\";42", [
+                ("double", "\"$()$tail\"", 0, 10, 0, 1),
+                ("sub", "", 1, 4, 0, 0),
+                ("script", "", 3, 3, 0, 0),
+                ("variable", "$tail", 4, 9, 0, 0),
+                ("number", "42", 11, 13, 2, 3),
+            ], [];
+        (parse_boundary_nested_empty, parse_tokens_boundary_nested_empty):
+            "\"$(\"$()\") $tail\";42", [
+                ("double", "\"$(\"$()\") $tail\"", 0, 16, 0, 1),
+                ("sub", "", 1, 9, 0, 0),
+                ("script", "", 3, 8, 0, 0),
+                ("double", "\"$()\"", 3, 8, 0, 0),
+                ("sub", "", 4, 7, 0, 0),
+                ("script", "", 6, 6, 0, 0),
+                ("variable", "$tail", 10, 15, 0, 0),
+                ("number", "42", 17, 19, 2, 3),
+            ], [];
+        (parse_boundary_unclosed_quote_eof, parse_tokens_boundary_unclosed_quote_eof):
+            "\"$( 'é", [
+                ("double", "\"$( 'é", 0, 7, 0, 1),
+                ("sub", "", 1, 7, 0, 0),
+                ("script", "", 4, 7, 0, 0),
+                ("single", "'é", 4, 7, 0, 0),
+            ], [
+                ("unterminated string at 4..7", 4, 7),
+                ("unterminated subexpression in string at 1..7", 1, 7),
+                ("unterminated string at 0..7", 0, 7),
+            ];
+        (parse_boundary_unclosed_root_keeps_nested_closer, parse_tokens_boundary_unclosed_root_keeps_nested_closer):
+            "\"$( $(1)", [
+                ("double", "\"$( $(1)", 0, 8, 0, 1),
+                ("sub", "", 1, 8, 0, 0),
+                ("script", "", 4, 8, 0, 0),
+                ("sub", "", 4, 8, 0, 0),
+                ("script", "", 6, 7, 0, 0),
+                ("number", "1", 6, 7, 0, 0),
+            ], [
+                ("unterminated subexpression in string at 1..8", 1, 8),
+                ("unterminated string at 0..8", 0, 8),
+            ];
+        (parse_boundary_unclosed_here_fragment_keeps_remainder, parse_tokens_boundary_unclosed_here_fragment_keeps_remainder):
+            "@\"\n$(')'; $é\n\"@;42", [
+                ("here-double", "@\"\n$(')'; $é\n\"@", 0, 16, 0, 1),
+                ("sub", "", 3, 13, 0, 0),
+                ("script", "", 5, 13, 0, 0),
+                ("single", "')'", 5, 8, 0, 0),
+                ("variable", "$é", 10, 13, 0, 0),
+                ("number", "42", 17, 19, 2, 3),
+            ], [];
+        (parse_boundary_fragment_lex_error_stays_local, parse_tokens_boundary_fragment_lex_error_stays_local):
+            "\"$(0x) $tail\";42", [
+                ("double", "\"$(0x) $tail\"", 0, 13, 0, 1),
+                ("sub", "", 1, 6, 0, 0),
+                ("script", "", 3, 5, 0, 0),
+                ("number", "0x", 3, 5, 0, 0),
+                ("variable", "$tail", 7, 12, 0, 0),
+                ("number", "42", 14, 16, 2, 3),
+            ], [];
+        (parse_boundary_fragment_parse_error_stays_local, parse_tokens_boundary_fragment_parse_error_stays_local):
+            "\"$(1 +) $tail\";42", [
+                ("double", "\"$(1 +) $tail\"", 0, 14, 0, 1),
+                ("sub", "", 1, 7, 0, 0),
+                ("script", "", 3, 6, 0, 0),
+                ("binary", "+", 3, 6, 0, 0),
+                ("number", "1", 3, 4, 0, 0),
+                ("error", "", 6, 6, 0, 0),
+                ("variable", "$tail", 8, 13, 0, 0),
+                ("number", "42", 15, 17, 2, 3),
+            ], [];
+        (parse_boundary_odd_even_backticks, parse_tokens_boundary_odd_even_backticks):
+            "\"`$(no) ``$(')') $tail\";42", [
+                ("double", "\"`$(no) ``$(')') $tail\"", 0, 23, 0, 1),
+                ("sub", "", 10, 16, 0, 0),
+                ("script", "", 12, 15, 0, 0),
+                ("single", "')'", 12, 15, 0, 0),
+                ("variable", "$tail", 17, 22, 0, 0),
+                ("number", "42", 24, 26, 2, 3),
+            ], [];
+        (parse_boundary_bom_unicode_nonzero_token, parse_tokens_boundary_bom_unicode_nonzero_token):
+            "\u{feff};\"é $(')') $tail\";42", [
+                ("double", "\"é $(')') $tail\"", 4, 21, 1, 2),
+                ("sub", "", 8, 14, 1, 1),
+                ("script", "", 10, 13, 1, 1),
+                ("single", "')'", 10, 13, 1, 1),
+                ("variable", "$tail", 15, 20, 1, 1),
+                ("number", "42", 22, 24, 3, 4),
+            ], [];
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct VariablePart {
+        raw: String,
+        span: Span,
+        range: TokenRange,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct VariableString {
+        kind: StringKind,
+        value: String,
+        parts: Vec<VariablePart>,
+    }
+
+    fn assert_variable_string(
+        out: ParseOutput,
+        src: &str,
+        kind: StringKind,
+        value: &str,
+        expected_parts: &[(&str, usize, usize)],
+    ) {
+        let mut strings = Vec::new();
+        out.script.walk(&mut |node| {
+            if let NodeKind::StringLiteral { kind, value, parts } = &node.kind {
+                strings.push(VariableString {
+                    kind: *kind,
+                    value: value.clone(),
+                    parts: parts
+                        .iter()
+                        .map(|part| {
+                            let NodeKind::Variable(raw) = &part.kind else {
+                                panic!("expected variable part, got {part:?}");
+                            };
+                            assert_eq!(part.span.slice(src), raw);
+                            VariablePart {
+                                raw: raw.clone(),
+                                span: part.span,
+                                range: part.range,
+                            }
+                        })
+                        .collect(),
+                });
+            }
+        });
+        let expected = vec![VariableString {
+            kind,
+            value: value.into(),
+            parts: expected_parts
+                .iter()
+                .map(|&(raw, start, end)| VariablePart {
+                    raw: raw.into(),
+                    span: Span::new(start, end),
+                    range: TokenRange { first: 0, end: 0 },
+                })
+                .collect(),
+        }];
+
+        assert_eq!(out.errors, []);
+        assert_eq!(strings, expected);
+        assert_eq!(crate::v2::reconstruct(&out.tokens), src);
+    }
+
+    // Both public entry points have independent literal expectations: lexer
+    // output is not the oracle for variable spellings or byte spans.
+    macro_rules! variable_interpolation_cases {
+        ($(($parse:ident, $tokens:ident): $src:literal, $value:literal, $kind:ident,
+            [$(($raw:literal, $start:literal, $end:literal)),* $(,)?];)*) => {
+            $(
+                #[test]
+                fn $parse() {
+                    let src = $src;
+
+                    let out = parse(src);
+
+                    assert_variable_string(out, src, StringKind::$kind, $value,
+                        &[$(($raw, $start, $end)),*]);
+                }
+
+                #[test]
+                fn $tokens() {
+                    let src = $src;
+                    let lexed = lex(src);
+                    assert_eq!(lexed.errors, []);
+
+                    let out = parse_tokens(src, lexed.tokens);
+
+                    assert_variable_string(out, src, StringKind::$kind, $value,
+                        &[$(($raw, $start, $end)),*]);
+                }
+            )*
+        };
+    }
+
+    variable_interpolation_cases! {
+        (parse_variable_unicode_initial, parse_tokens_variable_unicode_initial):
+            "\"$é\"", "\"$é\"", Double, [("$é", 1, 4)];
+        (parse_variable_unicode_continuation, parse_tokens_variable_unicode_continuation):
+            "\"$aé\"", "\"$aé\"", Double, [("$aé", 1, 5)];
+        (parse_variable_nonlatin, parse_tokens_variable_nonlatin):
+            "\"$变量\"", "\"$变量\"", Double, [("$变量", 1, 8)];
+        (parse_variable_bom_byte_span, parse_tokens_variable_bom_byte_span):
+            "\u{feff}\"$é\"", "\"$é\"", Double, [("$é", 4, 7)];
+        (parse_variable_numeric, parse_tokens_variable_numeric):
+            "\"$123\"", "\"$123\"", Double, [("$123", 1, 5)];
+        (parse_variable_numeric_qualifier, parse_tokens_variable_numeric_qualifier):
+            "\"$env:1\"", "\"$env:1\"", Double, [("$env:1", 1, 7)];
+        (parse_variable_repeated_qualifiers, parse_tokens_variable_repeated_qualifiers):
+            "\"$a:b:c\"", "\"$a:b:c\"", Double, [("$a:b:c", 1, 7)];
+        (parse_variable_unicode_qualifier, parse_tokens_variable_unicode_qualifier):
+            "\"$é:变量\"", "\"$é:变量\"", Double, [("$é:变量", 1, 11)];
+        (parse_variable_specials_source_order, parse_tokens_variable_specials_source_order):
+            "\"$_ $? $^ $$\"", "\"$_ $? $^ $$\"", Double,
+            [("$_", 1, 3), ("$?", 4, 6), ("$^", 7, 9), ("$$", 10, 12)];
+        (parse_variable_escaped_braced_terminator, parse_tokens_variable_escaped_braced_terminator):
+            "\"${a`}b}\"", "\"${a`}b}\"", Double, [("${a`}b}", 1, 8)];
+        (parse_variable_unicode_braced_terminator, parse_tokens_variable_unicode_braced_terminator):
+            "\"${é`}界}\"", "\"${é`}界}\"", Double, [("${é`}界}", 1, 11)];
+        (parse_variable_empty_braces, parse_tokens_variable_empty_braces):
+            "\"${}\"", "\"${}\"", Double, [("${}", 1, 4)];
+        (parse_variable_unclosed_braces, parse_tokens_variable_unclosed_braces):
+            "\"${open\"", "\"${open\"", Double, [];
+        (parse_variable_only_escaped_brace, parse_tokens_variable_only_escaped_brace):
+            "\"${a`}\"", "\"${a`}\"", Double, [];
+        (parse_variable_unsupported_dollars, parse_tokens_variable_unsupported_dollars):
+            "\"$ $- $: $!\"", "\"$ $- $: $!\"", Double, [];
+        (parse_variable_combining_mark_stops_name, parse_tokens_variable_combining_mark_stops_name):
+            "\"$a\u{301}\"", "\"$a\u{301}\"", Double, [("$a", 1, 3)];
+        (parse_variable_after_multibyte_text, parse_tokens_variable_after_multibyte_text):
+            "\"🦀 $aé $9\"", "\"🦀 $aé $9\"", Double,
+            [("$aé", 6, 10), ("$9", 11, 13)];
+        (parse_variable_odd_backtick_escapes_dollar, parse_tokens_variable_odd_backtick_escapes_dollar):
+            "\"`$é\"", "\"`$é\"", Double, [];
+        (parse_variable_even_backticks_leave_dollar_active, parse_tokens_variable_even_backticks_leave_dollar_active):
+            "\"``$é\"", "\"``$é\"", Double, [("$é", 3, 6)];
+        (parse_variable_three_backticks_escape_dollar, parse_tokens_variable_three_backticks_escape_dollar):
+            "\"```$é\"", "\"```$é\"", Double, [];
+        (parse_variable_escaped_multibyte_character, parse_tokens_variable_escaped_multibyte_character):
+            "\"`é$9\"", "\"`é$9\"", Double, [("$9", 4, 6)];
+        (parse_variable_here_unicode_initial, parse_tokens_variable_here_unicode_initial):
+            "@\"\n$é\n\"@", "@\"\n$é\n\"@", HereDouble, [("$é", 3, 6)];
+        (parse_variable_here_crlf_continuation, parse_tokens_variable_here_crlf_continuation):
+            "@\"\r\n$aé\r\n\"@", "@\"\r\n$aé\r\n\"@", HereDouble, [("$aé", 4, 8)];
+        (parse_variable_here_numeric_and_qualifiers, parse_tokens_variable_here_numeric_and_qualifiers):
+            "@\"\n$9 $a:b:c\n\"@", "@\"\n$9 $a:b:c\n\"@", HereDouble,
+            [("$9", 3, 5), ("$a:b:c", 6, 12)];
+        (parse_variable_here_specials, parse_tokens_variable_here_specials):
+            "@\"\n$_ $? $^ $$\n\"@", "@\"\n$_ $? $^ $$\n\"@", HereDouble,
+            [("$_", 3, 5), ("$?", 6, 8), ("$^", 9, 11), ("$$", 12, 14)];
+        (parse_variable_here_escaped_brace, parse_tokens_variable_here_escaped_brace):
+            "@\"\n${a`}b}\n\"@", "@\"\n${a`}b}\n\"@", HereDouble, [("${a`}b}", 3, 10)];
+        (parse_variable_here_malformed_braces, parse_tokens_variable_here_malformed_braces):
+            "@\"\n${a`}\n\"@", "@\"\n${a`}\n\"@", HereDouble, [];
+        (parse_variable_here_dangling_braced_escape, parse_tokens_variable_here_dangling_braced_escape):
+            "@\"\n${a`\n\"@", "@\"\n${a`\n\"@", HereDouble, [];
+        (parse_variable_here_escaped_dollar, parse_tokens_variable_here_escaped_dollar):
+            "@\"\n`$é\n\"@", "@\"\n`$é\n\"@", HereDouble, [];
+        (parse_variable_here_even_backticks, parse_tokens_variable_here_even_backticks):
+            "@\"\n``$é\n\"@", "@\"\n``$é\n\"@", HereDouble, [("$é", 5, 8)];
+        (parse_variable_here_trailing_escape, parse_tokens_variable_here_trailing_escape):
+            "@\"\n$é`\n\"@", "@\"\n$é`\n\"@", HereDouble, [("$é", 3, 6)];
+        (parse_variable_single_quoted_stays_literal, parse_tokens_variable_single_quoted_stays_literal):
+            "'$é ${a`}b}'", "'$é ${a`}b}'", Single, [];
+        (parse_variable_here_single_stays_literal, parse_tokens_variable_here_single_stays_literal):
+            "@'\n$é ${a`}b}\n'@", "@'\n$é ${a`}b}\n'@", HereSingle, [];
+    }
+
+    fn interpolation_depth_source(enclosing_blocks: usize, body: &str) -> String {
+        format!(
+            "{}\"{}\"{};42",
+            "begin {".repeat(enclosing_blocks),
+            body,
+            "}".repeat(enclosing_blocks)
+        )
+    }
+
+    fn assert_interpolation_depth(
+        out: ParseOutput,
+        src: &str,
+        strings: Vec<(Span, usize)>,
+        leaves: Vec<(&'static str, String, Span, TokenRange)>,
+    ) {
+        let mut actual_strings = Vec::new();
+        let mut actual_leaves = Vec::new();
+        // Exercise the ordinary public walk and let the whole output drop on
+        // the test harness's stack; these fixtures are bounded even before fixing.
+        out.script.walk(&mut |node| match &node.kind {
+            NodeKind::StringLiteral { parts, .. } => {
+                actual_strings.push((node.span, parts.len()));
+            }
+            NodeKind::Variable(_) | NodeKind::Number(_) | NodeKind::Error(_) => {
+                actual_leaves.push(interpolation_shape(node));
+            }
+            NodeKind::Flow { keyword, .. } => {
+                actual_leaves.push(("flow", keyword.clone(), node.span, node.range));
+            }
+            _ => {}
+        });
+
+        assert_eq!((actual_strings, actual_leaves), (strings, leaves));
+        assert_eq!(out.errors, []);
+        assert_eq!(crate::v2::reconstruct(&out.tokens), src);
+    }
+
+    // One public parse per case, with literal coordinates and no private depth
+    // oracle. `begin` blocks add statement nesting without condition expressions.
+    macro_rules! interpolation_depth_cases {
+        ($(($parse:ident, $tokens:ident): $src:expr,
+            [$(($string_start:literal, $string_end:literal, $parts:literal)),* $(,)?],
+            [$(($tag:literal, $raw:literal, $start:literal, $end:literal,
+                $first:literal, $last:literal)),* $(,)?];)*) => {
+            $(
+                #[test]
+                fn $parse() {
+                    let src = $src;
+
+                    let out = parse(&src);
+
+                    assert_interpolation_depth(out, &src,
+                        vec![$((Span::new($string_start, $string_end), $parts)),*],
+                        vec![$(($tag, $raw.into(), Span::new($start, $end),
+                            TokenRange { first: $first, end: $last })),*]);
+                }
+
+                #[test]
+                fn $tokens() {
+                    let src = $src;
+                    let lexed = lex(&src);
+                    assert_eq!(lexed.errors, []);
+
+                    let out = parse_tokens(&src, lexed.tokens);
+
+                    assert_interpolation_depth(out, &src,
+                        vec![$((Span::new($string_start, $string_end), $parts)),*],
+                        vec![$(($tag, $raw.into(), Span::new($start, $end),
+                            TokenRange { first: $first, end: $last })),*]);
+                }
+            )*
+        };
+    }
+
+    interpolation_depth_cases! {
+        (parse_depth_63_extracts_parts, parse_tokens_depth_63_extracts_parts):
+            interpolation_depth_source(61, "$é $(1)"),
+            [(427, 437, 2)], [
+                ("variable", "$é", 428, 431, 122, 122),
+                ("number", "1", 434, 435, 122, 122),
+                ("number", "42", 499, 501, 185, 186),
+            ];
+        (parse_depth_64_silently_omits_parts, parse_tokens_depth_64_silently_omits_parts):
+            interpolation_depth_source(62, "$é $(1)"),
+            [(434, 444, 0)], [
+                ("number", "42", 507, 509, 188, 189),
+            ];
+        (parse_depth_detached_levels_reach_cutoff, parse_tokens_depth_detached_levels_reach_cutoff):
+            interpolation_depth_source(58, r#"$("$("$é")")"#),
+            [(406, 421, 1), (409, 419, 1), (412, 417, 0)], [
+                ("number", "42", 480, 482, 176, 177),
+            ];
+        (parse_depth_fragment_expression_200_allowed, parse_tokens_depth_fragment_expression_200_allowed):
+            interpolation_depth_source(60,
+                &format!("$({}$é{};42) $tail", "(".repeat(136), ")".repeat(136))),
+            [(420, 709, 2)], [
+                ("variable", "$é", 559, 562, 120, 120),
+                ("number", "42", 699, 701, 120, 120),
+                ("variable", "$tail", 703, 708, 120, 120),
+                ("number", "42", 770, 772, 182, 183),
+            ];
+        (parse_depth_fragment_expression_201_recovers_locally, parse_tokens_depth_fragment_expression_201_recovers_locally):
+            interpolation_depth_source(60,
+                &format!("$({}$é{};42) $tail", "(".repeat(137), ")".repeat(137))),
+            [(420, 711, 2)], [
+                ("error", "too deep", 560, 563, 120, 120),
+                ("error", "too deep", 701, 703, 120, 120),
+                ("variable", "$tail", 705, 710, 120, 120),
+                ("number", "42", 772, 774, 182, 183),
+            ];
+        (parse_depth_fragment_statement_200_allowed, parse_tokens_depth_fragment_statement_200_allowed):
+            interpolation_depth_source(60,
+                &format!("$({}break{};42) $tail", "begin {".repeat(137), "}".repeat(137))),
+            [(420, 1535, 2)], [
+                ("flow", "break", 1382, 1387, 120, 120),
+                ("number", "42", 1525, 1527, 120, 120),
+                ("variable", "$tail", 1529, 1534, 120, 120),
+                ("number", "42", 1596, 1598, 182, 183),
+            ];
+        (parse_depth_fragment_statement_201_recovers_locally, parse_tokens_depth_fragment_statement_201_recovers_locally):
+            interpolation_depth_source(60,
+                &format!("$({}break;42{}) $tail", "begin {".repeat(138), "}".repeat(138))),
+            [(420, 1543, 2)], [
+                ("error", "too deep", 1389, 1394, 120, 120),
+                ("error", "too deep", 1395, 1397, 120, 120),
+                ("variable", "$tail", 1537, 1542, 120, 120),
+                ("number", "42", 1604, 1606, 182, 183),
+            ];
+    }
+
     #[test]
     fn add_type_csharp_extraction() {
         // a DllImport is parsed out of the inline C#, including the function
@@ -2837,6 +3961,422 @@ mod tests {
             }
         });
     }
+
+    fn add_type_metadata(tree: &Node) -> Vec<Option<(String, String)>> {
+        let mut metadata = Vec::new();
+        tree.walk(&mut |n| {
+            if let NodeKind::Command { name, csharp, .. } = &n.kind {
+                if matches!(&name.kind, NodeKind::BareWord(name) if name.eq_ignore_ascii_case("add-type"))
+                {
+                    metadata.push(csharp.as_deref().map(|node| {
+                        let NodeKind::CSharpMemberDef(cs) = &node.kind else {
+                            panic!("expected CSharpMemberDef, got {node:?}");
+                        };
+                        (cs.code.clone(), cs.parameter.clone())
+                    }));
+                }
+            }
+        });
+        metadata
+    }
+
+    fn assert_add_type_cache_invalidated_by(write: &str) {
+        let src = format!("$Code = 'class Old {{}}'\nAdd-Type $code\n{write}\nAdd-Type $CODE\n");
+
+        let out = parse(&src);
+
+        assert_eq!(out.errors, Vec::<ParseError>::new());
+        assert_eq!(
+            add_type_metadata(&out.script),
+            vec![Some(("class Old {}".into(), "positional".into())), None]
+        );
+    }
+
+    #[test]
+    fn add_type_cache_command_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe = Get-Content source.cs");
+    }
+
+    #[test]
+    fn add_type_cache_variable_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe = $unknown");
+    }
+
+    #[test]
+    fn add_type_cache_nonstring_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe = 42");
+    }
+
+    #[test]
+    fn add_type_cache_add_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe += 'class New {}'");
+    }
+
+    #[test]
+    fn add_type_cache_subtract_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe -= 'class New {}'");
+    }
+
+    #[test]
+    fn add_type_cache_multiply_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe *= 'class New {}'");
+    }
+
+    #[test]
+    fn add_type_cache_divide_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe /= 'class New {}'");
+    }
+
+    #[test]
+    fn add_type_cache_remainder_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe %= 'class New {}'");
+    }
+
+    #[test]
+    fn add_type_cache_coalescing_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe ??= 'class New {}'");
+    }
+
+    #[test]
+    fn add_type_cache_prefix_increment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("++$CoDe");
+    }
+
+    #[test]
+    fn add_type_cache_prefix_decrement_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("--$CoDe");
+    }
+
+    #[test]
+    fn add_type_cache_postfix_increment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe++");
+    }
+
+    #[test]
+    fn add_type_cache_postfix_decrement_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe--");
+    }
+
+    #[test]
+    fn add_type_cache_fresh_literal_restores_metadata_after_invalidation() {
+        let src = "$Code = 'class Old {}'\n$CoDe = 42\nAdd-Type $code\n\
+                   $CODE = 'class New {}'\nAdd-Type $code\n";
+
+        let out = parse(src);
+
+        assert_eq!(out.errors, Vec::<ParseError>::new());
+        assert_eq!(
+            add_type_metadata(&out.script),
+            vec![None, Some(("class New {}".into(), "positional".into()))]
+        );
+    }
+
+    #[test]
+    fn add_type_cache_write_to_another_variable_preserves_metadata() {
+        let src = "$Code = 'class Old {}'\n$other = 42\nAdd-Type $code\n";
+
+        let out = parse(src);
+
+        assert_eq!(out.errors, Vec::<ParseError>::new());
+        assert_eq!(
+            add_type_metadata(&out.script),
+            vec![Some(("class Old {}".into(), "positional".into()))]
+        );
+    }
+
+    #[test]
+    fn add_type_cache_assignment_rhs_sees_old_value_before_invalidation() {
+        let src = "$Code = 'class Old {}'\n$CoDe = Add-Type $code\nAdd-Type $code\n";
+
+        let out = parse(src);
+
+        assert_eq!(out.errors, Vec::<ParseError>::new());
+        assert_eq!(
+            add_type_metadata(&out.script),
+            vec![Some(("class Old {}".into(), "positional".into())), None]
+        );
+    }
+
+    #[test]
+    fn add_type_cache_compound_rhs_sees_old_value_before_invalidation() {
+        let src = "$Code = 'class Old {}'\n$CoDe += Add-Type $code\nAdd-Type $code\n";
+
+        let out = parse(src);
+
+        assert_eq!(out.errors, Vec::<ParseError>::new());
+        assert_eq!(
+            add_type_metadata(&out.script),
+            vec![Some(("class Old {}".into(), "positional".into())), None]
+        );
+    }
+
+    macro_rules! nonconstant_add_type_cases {
+        ($(($direct:ident, $cached:ident, $literal:literal)),+ $(,)?) => {
+            $(
+                #[test]
+                fn $direct() {
+                    let src = concat!("Add-Type -TypeDefinition ", $literal);
+
+                    let out = parse(src);
+
+                    assert_eq!(out.errors, Vec::<ParseError>::new());
+                    assert_eq!(add_type_metadata(&out.script), vec![None]);
+                }
+
+                #[test]
+                fn $cached() {
+                    let src = concat!(
+                        "$Code = 'class Old {}'\n$CODE = ", $literal,
+                        "\nAdd-Type -TypeDefinition $code"
+                    );
+
+                    let out = parse(src);
+
+                    assert_eq!(out.errors, Vec::<ParseError>::new());
+                    assert_eq!(add_type_metadata(&out.script), vec![None]);
+                }
+            )+
+        };
+    }
+
+    nonconstant_add_type_cases!(
+        (
+            add_type_direct_variable_interpolation_has_no_metadata,
+            add_type_cached_variable_interpolation_has_no_metadata,
+            "\"class $name {}\""
+        ),
+        (
+            add_type_direct_braced_interpolation_has_no_metadata,
+            add_type_cached_braced_interpolation_has_no_metadata,
+            "\"class ${name} {}\""
+        ),
+        (
+            add_type_direct_subexpression_has_no_metadata,
+            add_type_cached_subexpression_has_no_metadata,
+            "\"class $(Get-Name) {}\""
+        ),
+        (
+            add_type_direct_unicode_reference_has_no_metadata,
+            add_type_cached_unicode_reference_has_no_metadata,
+            "\"class $变量 {}\""
+        ),
+        (
+            add_type_direct_bare_dollar_has_no_metadata,
+            add_type_cached_bare_dollar_has_no_metadata,
+            "\"class A {} // $\""
+        ),
+        (
+            add_type_direct_escaped_backtick_has_no_metadata,
+            add_type_cached_escaped_backtick_has_no_metadata,
+            "\"class ``$name {}\""
+        ),
+        (
+            add_type_direct_escaped_then_active_dollar_has_no_metadata,
+            add_type_cached_escaped_then_active_dollar_has_no_metadata,
+            "\"`$literal $name\""
+        ),
+        (
+            add_type_direct_here_variable_interpolation_has_no_metadata,
+            add_type_cached_here_variable_interpolation_has_no_metadata,
+            "@\"\nclass $name {}\n\"@"
+        ),
+        (
+            add_type_direct_here_braced_interpolation_has_no_metadata,
+            add_type_cached_here_braced_interpolation_has_no_metadata,
+            "@\"\nclass ${name} {}\n\"@"
+        ),
+        (
+            add_type_direct_here_subexpression_has_no_metadata,
+            add_type_cached_here_subexpression_has_no_metadata,
+            "@\"\nclass $(Get-Name) {}\n\"@"
+        ),
+        (
+            add_type_direct_here_unicode_reference_has_no_metadata,
+            add_type_cached_here_unicode_reference_has_no_metadata,
+            "@\"\nclass $é {}\n\"@"
+        ),
+        (
+            add_type_direct_here_escaped_backtick_has_no_metadata,
+            add_type_cached_here_escaped_backtick_has_no_metadata,
+            "@\"\nclass ``$name {}\n\"@"
+        ),
+    );
+
+    #[derive(Debug, PartialEq)]
+    struct ConstantMetadata {
+        code: String,
+        parameter: String,
+        code_span: Span,
+        command_span: Span,
+        metadata_span: Span,
+        import_count: usize,
+        apis: Vec<String>,
+    }
+
+    fn constant_metadata(tree: &Node) -> Vec<Option<ConstantMetadata>> {
+        let mut metadata = Vec::new();
+        tree.walk(&mut |n| {
+            if let NodeKind::Command { name, csharp, .. } = &n.kind {
+                if matches!(&name.kind, NodeKind::BareWord(name) if name.eq_ignore_ascii_case("add-type"))
+                {
+                    metadata.push(csharp.as_deref().map(|node| {
+                        let NodeKind::CSharpMemberDef(cs) = &node.kind else {
+                            panic!("expected CSharpMemberDef, got {node:?}");
+                        };
+                        ConstantMetadata {
+                            code: cs.code.clone(),
+                            parameter: cs.parameter.clone(),
+                            code_span: cs.code_span,
+                            command_span: n.span,
+                            metadata_span: node.span,
+                            import_count: cs.imports.len(),
+                            apis: cs.apis.clone(),
+                        }
+                    }));
+                }
+            }
+        });
+        metadata
+    }
+
+    macro_rules! constant_add_type_cases {
+        ($(($name:ident, $src:literal, $code:literal, $body:expr, $cmd:expr)),+ $(,)?) => {
+            $(
+                #[test]
+                fn $name() {
+                    let src = $src;
+
+                    let out = parse(src);
+
+                    assert_eq!(out.errors, Vec::<ParseError>::new());
+                    assert_eq!(constant_metadata(&out.script), vec![Some(ConstantMetadata {
+                        code: $code.into(),
+                        parameter: "typedefinition".into(),
+                        code_span: $body,
+                        command_span: $cmd,
+                        metadata_span: $cmd,
+                        import_count: 0,
+                        apis: vec![],
+                    })]);
+                }
+            )+
+        };
+    }
+
+    constant_add_type_cases!(
+        (
+            add_type_direct_single_quoted_keeps_dollars,
+            "Add-Type -TypeDefinition '$name ${name} $(Get-Name) `'",
+            "$name ${name} $(Get-Name) `",
+            Span::new(26, 53),
+            Span::new(0, 54)
+        ),
+        (
+            add_type_cached_single_quoted_keeps_dollars,
+            "$Code = '$name ${name} $(Get-Name) `'\nAdd-Type -TypeDefinition $code",
+            "$name ${name} $(Get-Name) `",
+            Span::new(9, 36),
+            Span::new(38, 68)
+        ),
+        (
+            add_type_direct_single_here_keeps_dollars,
+            "Add-Type -TypeDefinition @'\n$name ${name} $(Get-Name) `\n'@",
+            "$name ${name} $(Get-Name) `",
+            Span::new(28, 55),
+            Span::new(0, 58)
+        ),
+        (
+            add_type_cached_single_here_keeps_dollars,
+            "$Code = @'\n$name ${name} $(Get-Name) `\n'@\nAdd-Type -TypeDefinition $code",
+            "$name ${name} $(Get-Name) `",
+            Span::new(11, 38),
+            Span::new(42, 72)
+        ),
+        (
+            add_type_direct_double_constant_preserves_metadata,
+            "Add-Type -TypeDefinition \"class A {}\"",
+            "class A {}",
+            Span::new(26, 36),
+            Span::new(0, 37)
+        ),
+        (
+            add_type_cached_double_constant_preserves_metadata,
+            "$Code = \"class A {}\"\nAdd-Type -TypeDefinition $code",
+            "class A {}",
+            Span::new(9, 19),
+            Span::new(21, 51)
+        ),
+        (
+            add_type_direct_double_here_constant_preserves_metadata,
+            "Add-Type -TypeDefinition @\"\nclass A {}\n\"@",
+            "class A {}",
+            Span::new(28, 38),
+            Span::new(0, 41)
+        ),
+        (
+            add_type_cached_double_here_constant_preserves_metadata,
+            "$Code = @\"\nclass A {}\n\"@\nAdd-Type -TypeDefinition $code",
+            "class A {}",
+            Span::new(11, 21),
+            Span::new(25, 55)
+        ),
+        (
+            add_type_direct_escaped_dollar_is_constant,
+            "Add-Type -TypeDefinition \"class `$name {}\"",
+            "class `$name {}",
+            Span::new(26, 41),
+            Span::new(0, 42)
+        ),
+        (
+            add_type_cached_escaped_dollar_is_constant,
+            "$Code = \"class `$name {}\"\nAdd-Type -TypeDefinition $code",
+            "class `$name {}",
+            Span::new(9, 24),
+            Span::new(26, 56)
+        ),
+        (
+            add_type_direct_odd_backticks_are_constant,
+            "Add-Type -TypeDefinition \"class ```$name {}\"",
+            "class ```$name {}",
+            Span::new(26, 43),
+            Span::new(0, 44)
+        ),
+        (
+            add_type_cached_odd_backticks_are_constant,
+            "$Code = \"class ```$name {}\"\nAdd-Type -TypeDefinition $code",
+            "class ```$name {}",
+            Span::new(9, 26),
+            Span::new(28, 58)
+        ),
+        (
+            add_type_direct_here_escaped_dollar_is_constant,
+            "Add-Type -TypeDefinition @\"\nclass `$name {}\n\"@",
+            "class `$name {}",
+            Span::new(28, 43),
+            Span::new(0, 46)
+        ),
+        (
+            add_type_cached_here_escaped_dollar_is_constant,
+            "$Code = @\"\nclass `$name {}\n\"@\nAdd-Type -TypeDefinition $code",
+            "class `$name {}",
+            Span::new(11, 26),
+            Span::new(30, 60)
+        ),
+        (
+            add_type_fresh_literal_reassignment_uses_new_metadata,
+            "$Code = 'class A {}'\n$CODE = 'class B {}'\nAdd-Type -TypeDefinition $code",
+            "class B {}",
+            Span::new(30, 40),
+            Span::new(42, 72)
+        ),
+        (
+            add_type_unicode_bom_uses_original_source_spans,
+            "\u{feff}# é\n$Code = 'class A {}'\nAdd-Type -TypeDefinition $code",
+            "class A {}",
+            Span::new(17, 27),
+            Span::new(29, 59)
+        ),
+    );
 
     #[test]
     fn interpolation_parts_have_precise_spans() {

@@ -27,6 +27,67 @@
 //!   source text (split into positional and named, but not parsed into
 //!   expressions); the `[...]`-vs-bareword decision is a glued-character
 //!   heuristic rather than full command/expression-mode resolution.
+//!
+//! # Raw string interpolation
+//!
+//! For double-quoted strings and double-quoted here-strings, interpolation is
+//! recognized from the raw body, before legacy decoding can erase escape
+//! distinctions, rather than from `StringLiteral::value`. A backtick skips the
+//! next raw character: an odd run of backticks escapes a following `$`, while
+//! an even run leaves it active. Escaped dollars produce no interpolation part.
+//! Any unescaped dollar marks the string `expandable`, but only supported
+//! variable references and `$()` subexpressions produce `parts`, in source
+//! order. Unsupported dollars can therefore leave `expandable` true with no
+//! parts. Single-quoted forms remain literal.
+//!
+//! The lexer and parser share an iterative, heap-framed scanner for `$()`
+//! boundaries. It balances code parentheses while respecting backtick escapes,
+//! single/double quotes (including doubled quotes), line comments, nested block
+//! comments, and here-strings, including nested subexpressions in expandable
+//! strings. Parentheses inside those quoted/commented regions do not close the
+//! surrounding subexpression. This is lexical boundary recognition, not full
+//! PowerShell grammar validation; fragment parsing still uses the legacy lexer.
+//!
+//! A closed fragment is parsed from its raw interior. An unclosed fragment is
+//! parsed best-effort from exactly the available remainder, without inventing a
+//! closing delimiter. Recovery may retain fragment `ErrorNode`s; fragment
+//! diagnostics and the overflow latch stay local, not in the enclosing parser's
+//! errors. Detached fragment parsers inherit the enclosing statement/expression
+//! depth, including through nested interpolation: the shared budget permits
+//! depth 100 and rejects the next guarded entry, rather than restarting at zero.
+//!
+//! `raw`, legacy-decoded `value`, and existing here-string newline trimming are
+//! unchanged. Locations remain coarse v1 locations: interpolation variables and
+//! subexpression wrappers use the outer string's location, while fragment
+//! contents can retain fragment-local locations. There are no precise fragment
+//! spans, decoded-text-to-source map, or full PowerShell runtime decoding
+//! guarantees.
+//!
+//! # Add-Type source cache
+//!
+//! Inline C# extraction accepts eligible string literals directly or through a
+//! parser-local cache of plain, unscoped variable assignments. Recognized writes
+//! (`=`, `+=`, `-=`, `*=`, `/=`, `%=`, `??=`) invalidate that variable's entry
+//! after parsing the RHS, so an `Add-Type` on the RHS can still use the old entry.
+//! Prefix/postfix `++` and `--` on such a variable also invalidate its entry.
+//! Only `=` with an eligible string-literal RHS installs or restores an entry;
+//! writes to another variable leave it alone.
+//!
+//! Single-quoted strings and single-quoted here-strings are eligible. For
+//! double-quoted forms, eligibility conservatively rejects any unescaped `$`
+//! in the raw spelling; a backtick skips the next character. This does not rely
+//! on `expandable` or the interpolation-parts list, which does not cover every
+//! reference. Raw interpolation recognition does not relax this eligibility
+//! check.
+//! Unknown variables and rejected strings do not supply confirmed C# metadata.
+//! Missing metadata is neither a safety verdict nor proof that `Add-Type` is
+//! absent or cannot execute.
+//!
+//! This is a bounded syntactic cache in linear parser traversal order, not
+//! scope, branch, function, or dataflow analysis. It does not track indirect
+//! writes or alternate runtime values. Extraction retains the lexer's existing
+//! string-value decoding and locations; eligibility adds no full PowerShell
+//! decoding or decoded-text-to-source mapping guarantee.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -48,6 +109,27 @@ fn make_loc(tok: &Token) -> Location {
 
 fn box_node(n: AstNode) -> Box<AstNode> {
     Box::new(n)
+}
+
+fn is_constant_string(s: &StringLiteral) -> bool {
+    match s.kind.as_str() {
+        "single" | "here_single" => return true,
+        "double" | "here_double" => {}
+        _ => return false,
+    }
+    // Decoded text loses the distinction between `$ and $. Interpolation parts
+    // are also incomplete, so conservatively check the original spelling.
+    let mut chars = s.raw.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => {
+                chars.next();
+            }
+            '$' => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Stamp a location onto every node in the subtree (for interpolation nodes).
@@ -88,7 +170,7 @@ static DLLIMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static VAR_REF: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$(?:\{[^}]*\}|[A-Za-z_][\w]*(?::[A-Za-z_][\w]*)?|[_?^$])")
+    Regex::new(r"^\$(?:\{[^}]*\}|[A-Za-z_][\w]*(?::[A-Za-z_][\w]*)?|[_?^$])")
         .expect("VAR_REF is a valid compile-time regex")
 });
 
@@ -254,8 +336,50 @@ pub fn parse_csharp_member_def(code: &str) -> CSharpMemberDef {
     }
 }
 
-/// Extract interpolation nodes from an expandable string body.
-fn extract_interpolations(text: &str, loc: &Location) -> Vec<AstNode> {
+/// Borrow the undecoded body, keeping the lexer's existing here-string trimming.
+fn raw_expandable_body<'a>(raw: &'a str, kind: &str) -> Option<&'a str> {
+    match kind {
+        "double" => {
+            let body = raw.strip_prefix('"')?;
+            let chars: Vec<char> = body.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                match chars[i] {
+                    '`' => i += 2,
+                    '$' if chars.get(i + 1) == Some(&'(') => {
+                        i = match super::lexer::scan_subexpression_end(&chars, i) {
+                            super::lexer::SubexpressionEnd::Closed(end) => end,
+                            // An EOF quote inside an unfinished fragment is
+                            // available body text, not an outer closing quote.
+                            super::lexer::SubexpressionEnd::Unterminated => return Some(body),
+                        };
+                    }
+                    '"' if chars.get(i + 1) == Some(&'"') => i += 2,
+                    '"' => {
+                        let end: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
+                        return Some(&body[..end]);
+                    }
+                    _ => i += 1,
+                }
+            }
+            Some(body)
+        }
+        "here_double" => {
+            let header = raw.strip_prefix("@\"")?;
+            let body = header.find(['\r', '\n']).map_or("", |i| &header[i..]);
+            let body = body
+                .strip_suffix("\"@")
+                .filter(|prefix| prefix.ends_with(['\r', '\n']))
+                .unwrap_or(body);
+            Some(body.trim_matches(['\r', '\n']))
+        }
+        _ => None,
+    }
+}
+
+/// Recognize unescaped raw dollars, even those outside the supported references.
+fn extract_interpolations(text: &str, loc: &Location, parser_depth: usize) -> (bool, Vec<AstNode>) {
+    let mut expandable = false;
     let mut parts = Vec::new();
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -265,69 +389,66 @@ fn extract_interpolations(text: &str, loc: &Location) -> Vec<AstNode> {
             i += 2;
             continue;
         }
-        if chars[i] == '$' && i + 1 < n && chars[i + 1] == '(' {
-            // $( ... )
-            let mut depth = 0;
-            let mut j = i + 1;
-            while j < n {
-                match chars[j] {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
+        if chars[i] != '$' {
+            i += 1;
+            continue;
+        }
+        expandable = true;
+        if chars.get(i + 1) == Some(&'(') {
+            let (j, end) = match super::lexer::scan_subexpression_end(&chars, i) {
+                super::lexer::SubexpressionEnd::Closed(end) => (end - 1, end),
+                // Parse exactly the available remainder, without adding a
+                // closing delimiter or leaking fragment errors to the parent.
+                super::lexer::SubexpressionEnd::Unterminated => (n, n),
+            };
             let inner: String = chars[i + 2..j].iter().collect();
             // The parser is resilient (it never aborts on bad input), so we can
             // parse the sub-expression directly without a panic guard.
             let toks = super::lexer::tokenize(&inner);
-            let sub = Parser::new(toks, inner.clone()).parse();
+            let mut parser = Parser::new(toks, inner.clone());
+            // Detached fragments share the enclosing recursion budget; starting
+            // over at zero would let interpolation bypass the depth limit.
+            parser.depth = parser_depth;
+            let sub = parser.parse();
             let mut n = AstNode::SubExpression(SubExpression {
                 loc: loc.clone(),
                 body: sub,
             });
             stamp_pos(&mut n, loc);
             parts.push(n);
-            i = j + 1;
+            i = end;
             continue;
         }
-        if chars[i] == '$' {
-            let rest: String = chars[i..].iter().collect();
-            if let Some(m) = VAR_REF.find(&rest) {
-                let raw = m.as_str().to_owned();
-                let inner = &raw[1..];
-                let (scope, name) = if inner.starts_with('{') && inner.ends_with('}') {
-                    (None, inner[1..inner.len() - 1].to_owned())
-                } else if let Some(colon) = inner.find(':') {
-                    (
-                        Some(inner[..colon].to_owned()),
-                        inner[colon + 1..].to_owned(),
-                    )
-                } else {
-                    (None, inner.to_owned())
-                };
-                parts.push(AstNode::Variable(Variable {
-                    loc: loc.clone(),
-                    name,
-                    scope,
-                    raw,
-                    ..Default::default()
-                }));
-                // `m.end()` is a byte offset into `rest`; `i` is a char index,
-                // so advance by the match's char count to stay aligned on
-                // non-ASCII variable names.
-                i += m.as_str().chars().count();
-                continue;
-            }
+        let rest: String = chars[i..].iter().collect();
+        if let Some(m) = VAR_REF.find(&rest) {
+            let raw = m.as_str().to_owned();
+            let inner = &raw[1..];
+            let (scope, name) = if inner.starts_with('{') && inner.ends_with('}') {
+                (None, inner[1..inner.len() - 1].to_owned())
+            } else if let Some(colon) = inner.find(':') {
+                (
+                    Some(inner[..colon].to_owned()),
+                    inner[colon + 1..].to_owned(),
+                )
+            } else {
+                (None, inner.to_owned())
+            };
+            parts.push(AstNode::Variable(Variable {
+                loc: loc.clone(),
+                name,
+                scope,
+                raw,
+                ..Default::default()
+            }));
+            // `m.end()` is a byte offset into `rest`; `i` is a char index,
+            // so advance by the match's char count to stay aligned on
+            // non-ASCII variable names.
+            i += m.as_str().chars().count();
+            continue;
         }
         i += 1;
     }
-    parts
+    (expandable, parts)
 }
 
 // Parser
@@ -345,8 +466,9 @@ pub struct Parser {
     /// Latched once `MAX_DEPTH` is crossed. While set, the recursive entry
     /// points stop descending and the input drains linearly.
     overflowed: bool,
-    /// `$plainvar` → assigned string-literal value, for resolving inline C#
-    /// passed to `Add-Type` by variable (simple constant propagation).
+    /// Eligible string values for plain, unscoped variables in parser traversal
+    /// order, keyed case-insensitively. Recognized writes invalidate entries;
+    /// only eligible literal `=` assignments restore them. Not a scope model.
     vars: HashMap<String, String>,
 }
 
@@ -389,9 +511,33 @@ impl Parser {
         }
     }
 
+    /// Construct a parser from tokens and their matching source.
+    ///
+    /// Unlike [`parse_tokens`], this constructor does not strip a leading BOM:
+    /// `source` must already be BOM-stripped, with token byte offsets relative
+    /// to that same string. Comments are filtered out, but newlines are kept.
+    /// If the last remaining token is not EOF (including an empty stream), an
+    /// EOF token is appended at the source end; an existing terminal EOF and its
+    /// metadata are preserved.
+    ///
+    /// This normalization does not validate arbitrary inconsistent token streams
+    /// or mismatched source text.
     pub fn new(tokens: Vec<Token>, source: String) -> Self {
         // drop comments, keep newlines
-        let toks = tokens.into_iter().filter(|t| t.ty != T::Comment).collect();
+        let mut toks: Vec<Token> = tokens.into_iter().filter(|t| t.ty != T::Comment).collect();
+        // Cursor helpers require a terminal EOF, even for caller-supplied tokens.
+        if !matches!(toks.last(), Some(t) if t.ty == T::Eof) {
+            let (mut line, mut col) = (1, 1);
+            for ch in source.chars() {
+                if ch == '\n' {
+                    line += 1;
+                    col = 1;
+                } else {
+                    col += 1;
+                }
+            }
+            toks.push(Token::new(T::Eof, "", line, col, source.len()));
+        }
         Parser {
             toks,
             src: source,
@@ -469,10 +615,10 @@ impl Parser {
     // Entry
 
     pub fn parse(&mut self) -> ScriptBlock {
-        self.parse_statement_list(true, &[])
+        self.parse_statement_list(&[])
     }
 
-    fn parse_statement_list(&mut self, _top: bool, stop: &[T]) -> ScriptBlock {
+    fn parse_statement_list(&mut self, stop: &[T]) -> ScriptBlock {
         let loc = make_loc(self.cur());
         let mut sb = ScriptBlock {
             loc,
@@ -635,14 +781,15 @@ impl Parser {
         let target = self.parse_unary()?;
         let op = self.next().value.clone();
         self.skip_inline_newlines();
-        let value = self
-            .parse_statement()?
-            .unwrap_or_else(|| AstNode::ErrorNode(ErrorNode::default()));
-        // Constant propagation: remember `$plainvar = "literal"` so a later
-        // `Add-Type $plainvar` can recover the inline C# source.
+        let value = self.parse_statement();
+        // The RHS can still read the old value, but even a failed write must
+        // stop later Add-Type commands from using stale source.
+        self.invalidate_cached_variable(&target);
+        let value = value?.unwrap_or_else(|| AstNode::ErrorNode(ErrorNode::default()));
+        // Only an eligible literal `=` can restore the syntactic source cache.
         if op == "=" {
             if let (AstNode::Variable(v), AstNode::StringLiteral(s)) = (&target, &value) {
-                if v.scope.is_none() {
+                if v.scope.is_none() && is_constant_string(s) {
                     self.vars.insert(v.name.to_lowercase(), s.value.clone());
                 }
             }
@@ -653,6 +800,14 @@ impl Parser {
             operator: op,
             value: Some(box_node(value)),
         }))
+    }
+
+    fn invalidate_cached_variable(&mut self, node: &AstNode) {
+        if let AstNode::Variable(v) = node {
+            if v.scope.is_none() {
+                self.vars.remove(&v.name.to_lowercase());
+            }
+        }
     }
 
     // Control flow
@@ -1301,7 +1456,7 @@ impl Parser {
             });
         }
         self.next(); // {
-        let sb = self.parse_statement_list(false, &[T::RBrace]);
+        let sb = self.parse_statement_list(&[T::RBrace]);
         self.eat(T::RBrace);
         Ok(sb)
     }
@@ -1402,10 +1557,9 @@ impl Parser {
     ///
     /// Accepts it as the argument of `-TypeDefinition` / `-MemberDefinition`,
     /// or as a bare positional argument (`-TypeDefinition` is `Position 0` of
-    /// Add-Type's source parameter set). A variable argument is resolved to the
-    /// string literal it was assigned earlier in the script (simple constant
-    /// propagation), so `$c = @"..."@; Add-Type $c` is handled. Returns
-    /// `(code, parameter_label)`.
+    /// Add-Type's source parameter set). Only eligible literals or variables
+    /// with a current source-cache entry supply code; see the module's bounded
+    /// cache contract. Returns `(code, parameter_label)`.
     fn find_csharp_code(&self, elements: &[AstNode]) -> Option<(String, String)> {
         // 1) Named -MemberDefinition / -TypeDefinition.
         for (i, el) in elements.iter().enumerate() {
@@ -1439,11 +1593,11 @@ impl Parser {
         None
     }
 
-    /// A string literal's value, or an unscoped variable resolved to the string
-    /// it was assigned earlier in the script.
+    /// An eligible literal's existing decoded value, or the current cached value
+    /// of an unscoped variable. This does not evaluate PowerShell expressions.
     fn as_csharp_code(&self, node: &AstNode) -> Option<String> {
         match node {
-            AstNode::StringLiteral(s) => Some(s.value.clone()),
+            AstNode::StringLiteral(s) if is_constant_string(s) => Some(s.value.clone()),
             AstNode::Variable(v) if v.scope.is_none() => {
                 self.vars.get(&v.name.to_lowercase()).cloned()
             }
@@ -1829,6 +1983,9 @@ impl Parser {
         {
             let op_tok = self.next().clone();
             let operand = self.parse_unary()?;
+            if matches!(op_tok.value.as_str(), "++" | "--") {
+                self.invalidate_cached_variable(&operand);
+            }
             return Ok(AstNode::UnaryExpression(UnaryExpression {
                 loc: make_loc(&op_tok),
                 operator: op_tok.value.to_lowercase(),
@@ -1987,6 +2144,7 @@ impl Parser {
                 });
             } else if tok.ty == T::Operator && (tok.value == "++" || tok.value == "--") {
                 self.next();
+                self.invalidate_cached_variable(&node);
                 node = AstNode::UnaryExpression(UnaryExpression {
                     loc: make_loc(&tok),
                     operator: tok.value,
@@ -2096,13 +2254,9 @@ impl Parser {
                     _ => "here_double",
                 };
                 let text = tok.text.clone().unwrap_or_default();
-                let expandable =
-                    (tok.ty == T::StringDq || tok.ty == T::HereStringDq) && text.contains('$');
-                let parts = if expandable {
-                    extract_interpolations(&text, &make_loc(&tok))
-                } else {
-                    Vec::new()
-                };
+                let (expandable, parts) = raw_expandable_body(&tok.value, kind)
+                    .map(|body| extract_interpolations(body, &make_loc(&tok), self.depth))
+                    .unwrap_or_default();
                 let node = AstNode::StringLiteral(StringLiteral {
                     loc: make_loc(&tok),
                     value: text,
@@ -2126,7 +2280,7 @@ impl Parser {
             }
             T::DollarParen => {
                 self.next();
-                let sb = self.parse_statement_list(false, &[T::RParen]);
+                let sb = self.parse_statement_list(&[T::RParen]);
                 self.eat(T::RParen);
                 return Ok(AstNode::SubExpression(SubExpression {
                     loc: make_loc(&tok),
@@ -2135,7 +2289,7 @@ impl Parser {
             }
             T::AtParen => {
                 self.next();
-                let sb = self.parse_statement_list(false, &[T::RParen]);
+                let sb = self.parse_statement_list(&[T::RParen]);
                 self.eat(T::RParen);
                 let elems = sb.statements;
                 return Ok(AstNode::ArrayExpression(ArrayExpression {
@@ -2301,6 +2455,32 @@ pub fn parse(source: &str) -> (ScriptBlock, Vec<String>) {
 
 /// Parse pre-tokenized input, avoiding a redundant lex pass when the caller
 /// already has the token stream (the engine tokenizes once and reuses it).
+///
+/// Tokens must correspond to `source`, as produced by [`super::lexer::tokenize`]:
+/// positions are byte offsets into the source with its leading BOM stripped.
+/// This function strips that BOM before passing the source to [`Parser::new`].
+/// Comments are filtered out, while newline tokens are retained.
+///
+/// If the last remaining token is not EOF, an EOF token is appended at the end
+/// of the BOM-stripped source, including for an empty token vector. Its position
+/// includes trailing whitespace; lines and columns are one-based, with LF
+/// advancing the line and other characters advancing the column by one.
+/// An existing terminal EOF and its metadata are left unchanged. This is only
+/// EOF normalization: arbitrary inconsistent streams and mismatched source text
+/// are not validated or guaranteed to parse safely.
+///
+/// Returns the script block and recovery diagnostics. Empty input produces an
+/// empty script with no diagnostics:
+///
+/// ```
+/// use poshtree::v1::parser::parse_tokens;
+///
+/// let (tree, errors) = parse_tokens(Vec::new(), "");
+///
+/// assert!(tree.statements.is_empty());
+/// assert!(errors.is_empty());
+/// assert_eq!((tree.loc.line, tree.loc.col, tree.loc.pos), (1, 1, 0));
+/// ```
 pub fn parse_tokens(tokens: Vec<Token>, source: &str) -> (ScriptBlock, Vec<String>) {
     // Strip a leading BOM so the byte offsets used for source slicing line up
     // with the BOM-less token stream produced by `tokenize`.
@@ -2323,6 +2503,261 @@ mod tests {
             }
         });
         found
+    }
+
+    #[test]
+    fn parse_tokens_empty_input_returns_empty_script_at_start() {
+        let tokens = Vec::new();
+        let src = "";
+
+        let (tree, errors) = parse_tokens(tokens, src);
+
+        assert_eq!(
+            (
+                tree.statements.len(),
+                tree.param_block.is_none(),
+                (tree.loc.line, tree.loc.col, tree.loc.pos),
+                errors,
+            ),
+            (0, true, (1, 1, 0), Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn parse_tokens_eof_only_preserves_empty_script_location() {
+        let src = "\n  ";
+        let tokens = vec![Token::new(T::Eof, "", 2, 3, 3)];
+
+        let (tree, errors) = parse_tokens(tokens, src);
+
+        assert_eq!(
+            (
+                tree.statements.len(),
+                tree.param_block.is_none(),
+                (tree.loc.line, tree.loc.col, tree.loc.pos),
+                errors,
+            ),
+            (0, true, (2, 3, 3), Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn parse_tokens_comments_without_eof_returns_empty_script() {
+        let src = "# comment";
+        let tokens = vec![Token::new(T::Comment, "# comment", 1, 1, 0)];
+
+        let (tree, errors) = parse_tokens(tokens, src);
+
+        assert_eq!(
+            (
+                tree.statements.len(),
+                tree.param_block.is_none(),
+                (tree.loc.line, tree.loc.col, tree.loc.pos),
+                errors,
+            ),
+            (0, true, (1, 10, 9), Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn parse_tokens_statements_without_eof_keeps_both_numbers() {
+        let src = "1; 2";
+        let tokens = vec![
+            Token::new(T::Number, "1", 1, 1, 0),
+            Token::new(T::Semicolon, ";", 1, 2, 1),
+            Token::new(T::Number, "2", 1, 4, 3),
+        ];
+
+        let (tree, errors) = parse_tokens(tokens, src);
+
+        assert_eq!(errors, Vec::<String>::new());
+        assert!(
+            matches!(
+                tree.statements.as_slice(),
+                [AstNode::NumberLiteral(first), AstNode::NumberLiteral(second)]
+                    if first.value == Some(1.0) && second.value == Some(2.0)
+            ),
+            "expected top-level numbers 1 and 2, got {:?}",
+            tree.statements
+        );
+    }
+
+    #[test]
+    fn parser_new_empty_input_parses_empty_script_at_start() {
+        let mut parser = Parser::new(Vec::new(), String::new());
+
+        let tree = parser.parse();
+
+        assert_eq!(
+            (
+                tree.statements.len(),
+                tree.param_block.is_none(),
+                (tree.loc.line, tree.loc.col, tree.loc.pos),
+                parser.errors,
+            ),
+            (0, true, (1, 1, 0), Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn parse_tokens_bom_unicode_crlf_comment_without_eof_uses_stripped_source_end() {
+        let src = "\u{feff}<# é\r\n猫 #>";
+        let mut tokens = super::super::lexer::tokenize(src);
+        tokens.retain(|token| token.ty != T::Eof);
+
+        let (tree, errors) = parse_tokens(tokens, src);
+
+        assert_eq!(
+            (
+                tree.statements.len(),
+                tree.param_block.is_none(),
+                (tree.loc.line, tree.loc.col, tree.loc.pos),
+                errors,
+            ),
+            (0, true, (2, 5, 13), Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn parse_tokens_trailing_whitespace_without_eof_reports_source_end() {
+        let src = "(\t \r\n \n  ";
+        let mut tokens = super::super::lexer::tokenize(src);
+        tokens.retain(|token| token.ty != T::Eof);
+
+        let (tree, errors) = parse_tokens(tokens, src);
+
+        assert_eq!(errors, vec!["unexpected Eof \"\""]);
+        assert_eq!(
+            (
+                tree.param_block.is_none(),
+                (tree.loc.line, tree.loc.col, tree.loc.pos),
+            ),
+            (true, (1, 1, 0))
+        );
+        assert!(
+            matches!(
+                tree.statements.as_slice(),
+                [AstNode::ErrorNode(error)]
+                    if (error.loc.line, error.loc.col, error.loc.pos) == (3, 3, 9)
+                        && error.message == "unexpected Eof \"\""
+                        && error.raw.is_empty()
+            ),
+            "expected one empty recovery node at (3, 3, 9), got {:?}",
+            tree.statements
+        );
+    }
+
+    #[test]
+    fn parse_tokens_unclosed_paren_crlf_without_eof_returns_error_node_and_diagnostic() {
+        let src = "(\r\n";
+        let mut tokens = super::super::lexer::tokenize(src);
+        tokens.retain(|token| token.ty != T::Eof);
+
+        let (tree, errors) = parse_tokens(tokens, src);
+
+        assert_eq!(errors, vec!["unexpected Eof \"\""]);
+        assert_eq!(
+            (
+                tree.param_block.is_none(),
+                (tree.loc.line, tree.loc.col, tree.loc.pos),
+            ),
+            (true, (1, 1, 0))
+        );
+        assert!(
+            matches!(
+                tree.statements.as_slice(),
+                [AstNode::ErrorNode(error)]
+                    if (error.loc.line, error.loc.col, error.loc.pos) == (2, 1, 3)
+                        && error.message == "unexpected Eof \"\""
+                        && error.raw.is_empty()
+            ),
+            "expected one empty recovery node at (2, 1, 3), got {:?}",
+            tree.statements
+        );
+    }
+
+    #[test]
+    fn parse_top_level_statements_keeps_both_numbers() {
+        let src = "1; 2";
+
+        let (tree, errors) = parse(src);
+
+        assert!(errors.is_empty(), "expected no errors, got {errors:?}");
+        assert!(
+            matches!(
+                tree.statements.as_slice(),
+                [AstNode::NumberLiteral(first), AstNode::NumberLiteral(second)]
+                    if first.value == Some(1.0) && second.value == Some(2.0)
+            ),
+            "expected top-level numbers 1 and 2, got {:?}",
+            tree.statements
+        );
+    }
+
+    #[test]
+    fn parse_block_keeps_following_number_outside() {
+        let src = "{1}; 2";
+
+        let (tree, errors) = parse(src);
+
+        assert!(errors.is_empty(), "expected no errors, got {errors:?}");
+        assert!(
+            matches!(
+                tree.statements.as_slice(),
+                [AstNode::ScriptBlockExpression(block), AstNode::NumberLiteral(second)]
+                    if second.value == Some(2.0)
+                        && matches!(
+                            block.body.statements.as_slice(),
+                            [AstNode::NumberLiteral(first)] if first.value == Some(1.0)
+                        )
+            ),
+            "expected a block containing 1 followed by top-level 2, got {:?}",
+            tree.statements
+        );
+    }
+
+    #[test]
+    fn parse_subexpression_keeps_following_number_outside() {
+        let src = "$(1); 2";
+
+        let (tree, errors) = parse(src);
+
+        assert!(errors.is_empty(), "expected no errors, got {errors:?}");
+        assert!(
+            matches!(
+                tree.statements.as_slice(),
+                [AstNode::SubExpression(sub), AstNode::NumberLiteral(second)]
+                    if second.value == Some(2.0)
+                        && matches!(
+                            sub.body.statements.as_slice(),
+                            [AstNode::NumberLiteral(first)] if first.value == Some(1.0)
+                        )
+            ),
+            "expected a subexpression containing 1 followed by top-level 2, got {:?}",
+            tree.statements
+        );
+    }
+
+    #[test]
+    fn parse_array_keeps_following_number_outside() {
+        let src = "@(1); 2";
+
+        let (tree, errors) = parse(src);
+
+        assert!(errors.is_empty(), "expected no errors, got {errors:?}");
+        assert!(
+            matches!(
+                tree.statements.as_slice(),
+                [AstNode::ArrayExpression(array), AstNode::NumberLiteral(second)]
+                    if second.value == Some(2.0)
+                        && matches!(
+                            array.elements.as_slice(),
+                            [AstNode::NumberLiteral(first)] if first.value == Some(1.0)
+                        )
+            ),
+            "expected an array containing 1 followed by top-level 2, got {:?}",
+            tree.statements
+        );
     }
 
     #[test]
@@ -2365,12 +2800,52 @@ mod tests {
     }
 
     #[test]
-    fn recovers_from_unicode_without_panicking() {
-        // A lone closing brace forces error recovery, which slices the source;
-        // with multi-byte input this must not panic.
-        let (_, errors) = parse("café }");
-        // whether or not recovery fired, reaching this line means no panic.
-        let _ = errors;
+    fn parse_unicode_command_and_unmatched_brace_keeps_command_and_reports_recovery() {
+        let src = "café }";
+
+        let (tree, errors) = parse(src);
+
+        assert_eq!(errors, vec!["unexpected RBrace \"}\""]);
+        assert!(
+            matches!(
+                tree.statements.as_slice(),
+                [AstNode::Command(command), AstNode::ErrorNode(error)]
+                    if command.name == "café"
+                        && command.elements.is_empty()
+                        && (command.loc.line, command.loc.col, command.loc.pos) == (1, 1, 0)
+                        && error.message == "unexpected RBrace \"}\""
+                        && error.raw == "}"
+                        && (error.loc.line, error.loc.col, error.loc.pos) == (1, 6, 6)
+            ),
+            "expected café command and unmatched-brace recovery at (1, 6, 6), got {:?}",
+            tree.statements
+        );
+    }
+
+    #[test]
+    fn parse_unicode_recovery_at_crlf_keeps_following_number_at_byte_location() {
+        let src = "café }猫\r\n42";
+
+        let (tree, errors) = parse(src);
+
+        assert_eq!(errors, vec!["unexpected RBrace \"}\""]);
+        assert!(
+            matches!(
+                tree.statements.as_slice(),
+                [AstNode::Command(command), AstNode::ErrorNode(error), AstNode::NumberLiteral(number)]
+                    if command.name == "café"
+                        && command.elements.is_empty()
+                        && (command.loc.line, command.loc.col, command.loc.pos) == (1, 1, 0)
+                        && error.message == "unexpected RBrace \"}\""
+                        && error.raw == "}猫"
+                        && (error.loc.line, error.loc.col, error.loc.pos) == (1, 6, 6)
+                        && number.raw == "42"
+                        && number.value == Some(42.0)
+                        && (number.loc.line, number.loc.col, number.loc.pos) == (2, 1, 12)
+            ),
+            "expected Unicode recovery before CRLF and number 42 at (2, 1, 12), got {:?}",
+            tree.statements
+        );
     }
 
     #[test]
@@ -2417,14 +2892,14 @@ public static extern IntPtr CreateThread(IntPtr a);
     #[test]
     fn add_type_named_inline_extracts_csharp() {
         let imps = add_type_imports(&format!("Add-Type -TypeDefinition {WIN32}"));
-        assert!(imps.contains(&"CreateThread".to_string()), "{imps:?}");
+        assert!(imps.iter().any(|name| name == "CreateThread"), "{imps:?}");
     }
 
     #[test]
     fn add_type_positional_inline_extracts_csharp() {
         // `Add-Type @"..."@` has no -TypeDefinition, so the source is positional.
         let imps = add_type_imports(&format!("Add-Type {WIN32}"));
-        assert!(imps.contains(&"CreateThread".to_string()), "{imps:?}");
+        assert!(imps.iter().any(|name| name == "CreateThread"), "{imps:?}");
     }
 
     #[test]
@@ -2442,11 +2917,39 @@ public static extern IntPtr CreateThread(IntPtr a);
     }
 
     #[test]
-    fn dllimport_non_ascii_near_end_does_not_panic() {
-        // Same root cause, but with the paren near the end so the bad index
-        // could run past the buffer. Must not panic.
+    fn dllimport_non_ascii_near_end_retains_code_and_extracts_exact_signature() {
         let code = "\u{e9}[DllImport(\"k\")]public static extern void F(int a)";
-        let _ = parse_csharp_member_def(code);
+
+        let def = parse_csharp_member_def(code);
+
+        assert_eq!(
+            (
+                def.code.as_str(),
+                def.parameter.as_str(),
+                (def.loc.line, def.loc.col, def.loc.pos),
+            ),
+            (
+                "\u{e9}[DllImport(\"k\")]public static extern void F(int a)",
+                "",
+                (0, 0, 0),
+            )
+        );
+        assert_eq!(def.apis, vec!["F"]);
+        assert!(
+            matches!(
+                def.imports.as_slice(),
+                [import]
+                    if import.dll == "k"
+                        && import.function == "F"
+                        && import.returns == "void"
+                        && matches!(
+                            import.params.as_slice(),
+                            [param] if param.type_name == "int" && param.name == "a"
+                        )
+            ),
+            "expected one import of void F(int a) from k, got {:?}",
+            def.imports
+        );
     }
 
     #[test]
@@ -2461,7 +2964,9 @@ public static extern IntPtr CreateThread(IntPtr a);
     fn add_type_named_variable_is_resolved() {
         let src = format!("$c = {WIN32}\nAdd-Type -TypeDefinition $c");
         assert!(
-            add_type_imports(&src).contains(&"CreateThread".to_string()),
+            add_type_imports(&src)
+                .iter()
+                .any(|name| name == "CreateThread"),
             "named -TypeDefinition with a variable should resolve"
         );
     }
@@ -2471,7 +2976,9 @@ public static extern IntPtr CreateThread(IntPtr a);
         // The reported snippet's shape: `$Win32 = @"..."@; Add-Type $Win32`.
         let src = format!("$Win32 = {WIN32}\nAdd-Type $Win32");
         assert!(
-            add_type_imports(&src).contains(&"CreateThread".to_string()),
+            add_type_imports(&src)
+                .iter()
+                .any(|name| name == "CreateThread"),
             "positional variable should resolve to its assigned here-string"
         );
     }
@@ -2479,7 +2986,9 @@ public static extern IntPtr CreateThread(IntPtr a);
     #[test]
     fn add_type_variable_resolution_is_case_insensitive() {
         let src = format!("$Win32 = {WIN32}\nAdd-Type $win32");
-        assert!(add_type_imports(&src).contains(&"CreateThread".to_string()));
+        assert!(add_type_imports(&src)
+            .iter()
+            .any(|name| name == "CreateThread"));
     }
 
     #[test]
@@ -2487,6 +2996,414 @@ public static extern IntPtr CreateThread(IntPtr a);
         // No prior assignment to resolve, so this must attach nothing instead of panicking.
         assert!(add_type_imports("Add-Type $never_assigned").is_empty());
     }
+
+    fn add_type_metadata(tree: ScriptBlock) -> Vec<Option<(String, String)>> {
+        let mut metadata = Vec::new();
+        AstNode::ScriptBlock(tree).walk(&mut |n| {
+            if let AstNode::Command(cmd) = n {
+                if cmd.name.eq_ignore_ascii_case("add-type") {
+                    metadata.push(cmd.csharp.as_deref().map(|node| {
+                        let AstNode::CSharpMemberDef(cs) = node else {
+                            panic!("expected CSharpMemberDef, got {node:?}");
+                        };
+                        (cs.code.clone(), cs.parameter.clone())
+                    }));
+                }
+            }
+        });
+        metadata
+    }
+
+    fn assert_add_type_cache_invalidated_by(write: &str) {
+        let src = format!("$Code = 'class Old {{}}'\nAdd-Type $code\n{write}\nAdd-Type $CODE\n");
+
+        let (tree, errors) = parse(&src);
+
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(
+            add_type_metadata(tree),
+            vec![Some(("class Old {}".into(), "positional".into())), None]
+        );
+    }
+
+    #[test]
+    fn add_type_cache_command_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe = Get-Content source.cs");
+    }
+
+    #[test]
+    fn add_type_cache_variable_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe = $unknown");
+    }
+
+    #[test]
+    fn add_type_cache_nonstring_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe = 42");
+    }
+
+    #[test]
+    fn add_type_cache_add_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe += 'class New {}'");
+    }
+
+    #[test]
+    fn add_type_cache_subtract_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe -= 'class New {}'");
+    }
+
+    #[test]
+    fn add_type_cache_multiply_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe *= 'class New {}'");
+    }
+
+    #[test]
+    fn add_type_cache_divide_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe /= 'class New {}'");
+    }
+
+    #[test]
+    fn add_type_cache_remainder_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe %= 'class New {}'");
+    }
+
+    #[test]
+    fn add_type_cache_coalescing_assignment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe ??= 'class New {}'");
+    }
+
+    #[test]
+    fn add_type_cache_prefix_increment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("++$CoDe");
+    }
+
+    #[test]
+    fn add_type_cache_prefix_decrement_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("--$CoDe");
+    }
+
+    #[test]
+    fn add_type_cache_postfix_increment_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe++");
+    }
+
+    #[test]
+    fn add_type_cache_postfix_decrement_invalidates_only_later_metadata() {
+        assert_add_type_cache_invalidated_by("$CoDe--");
+    }
+
+    #[test]
+    fn add_type_cache_fresh_literal_restores_metadata_after_invalidation() {
+        let src = "$Code = 'class Old {}'\n$CoDe = 42\nAdd-Type $code\n\
+                   $CODE = 'class New {}'\nAdd-Type $code\n";
+
+        let (tree, errors) = parse(src);
+
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(
+            add_type_metadata(tree),
+            vec![None, Some(("class New {}".into(), "positional".into()))]
+        );
+    }
+
+    #[test]
+    fn add_type_cache_write_to_another_variable_preserves_metadata() {
+        let src = "$Code = 'class Old {}'\n$other = 42\nAdd-Type $code\n";
+
+        let (tree, errors) = parse(src);
+
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(
+            add_type_metadata(tree),
+            vec![Some(("class Old {}".into(), "positional".into()))]
+        );
+    }
+
+    #[test]
+    fn add_type_cache_assignment_rhs_sees_old_value_before_invalidation() {
+        let src = "$Code = 'class Old {}'\n$CoDe = Add-Type $code\nAdd-Type $code\n";
+
+        let (tree, errors) = parse(src);
+
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(
+            add_type_metadata(tree),
+            vec![Some(("class Old {}".into(), "positional".into())), None]
+        );
+    }
+
+    #[test]
+    fn add_type_cache_compound_rhs_sees_old_value_before_invalidation() {
+        let src = "$Code = 'class Old {}'\n$CoDe += Add-Type $code\nAdd-Type $code\n";
+
+        let (tree, errors) = parse(src);
+
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(
+            add_type_metadata(tree),
+            vec![Some(("class Old {}".into(), "positional".into())), None]
+        );
+    }
+
+    #[test]
+    fn add_type_cache_assignment_rhs_error_still_invalidates_metadata() {
+        let src = "$Code = 'class Old {}'\nAdd-Type $code\n$CoDe = )\nAdd-Type $code\n";
+
+        let (tree, errors) = parse(src);
+
+        assert_eq!(errors, vec!["unexpected RParen \")\""]);
+        assert_eq!(
+            add_type_metadata(tree),
+            vec![Some(("class Old {}".into(), "positional".into())), None]
+        );
+    }
+
+    macro_rules! nonconstant_add_type_cases {
+        ($(($direct:ident, $cached:ident, $literal:literal)),+ $(,)?) => {
+            $(
+                #[test]
+                fn $direct() {
+                    let src = concat!("Add-Type -TypeDefinition ", $literal);
+
+                    let (tree, errors) = parse(src);
+
+                    assert_eq!(errors, Vec::<String>::new());
+                    assert_eq!(add_type_metadata(tree), vec![None]);
+                }
+
+                #[test]
+                fn $cached() {
+                    let src = concat!(
+                        "$Code = 'class Old {}'\n$CODE = ", $literal,
+                        "\nAdd-Type -TypeDefinition $code"
+                    );
+
+                    let (tree, errors) = parse(src);
+
+                    assert_eq!(errors, Vec::<String>::new());
+                    assert_eq!(add_type_metadata(tree), vec![None]);
+                }
+            )+
+        };
+    }
+
+    nonconstant_add_type_cases!(
+        (
+            add_type_direct_variable_interpolation_has_no_metadata,
+            add_type_cached_variable_interpolation_has_no_metadata,
+            "\"class $name {}\""
+        ),
+        (
+            add_type_direct_braced_interpolation_has_no_metadata,
+            add_type_cached_braced_interpolation_has_no_metadata,
+            "\"class ${name} {}\""
+        ),
+        (
+            add_type_direct_subexpression_has_no_metadata,
+            add_type_cached_subexpression_has_no_metadata,
+            "\"class $(Get-Name) {}\""
+        ),
+        (
+            add_type_direct_unicode_reference_has_no_metadata,
+            add_type_cached_unicode_reference_has_no_metadata,
+            "\"class $变量 {}\""
+        ),
+        (
+            add_type_direct_bare_dollar_has_no_metadata,
+            add_type_cached_bare_dollar_has_no_metadata,
+            "\"class A {} // $\""
+        ),
+        (
+            add_type_direct_escaped_backtick_has_no_metadata,
+            add_type_cached_escaped_backtick_has_no_metadata,
+            "\"class ``$name {}\""
+        ),
+        (
+            add_type_direct_escaped_then_active_dollar_has_no_metadata,
+            add_type_cached_escaped_then_active_dollar_has_no_metadata,
+            "\"`$literal $name\""
+        ),
+        (
+            add_type_direct_here_variable_interpolation_has_no_metadata,
+            add_type_cached_here_variable_interpolation_has_no_metadata,
+            "@\"\nclass $name {}\n\"@"
+        ),
+        (
+            add_type_direct_here_braced_interpolation_has_no_metadata,
+            add_type_cached_here_braced_interpolation_has_no_metadata,
+            "@\"\nclass ${name} {}\n\"@"
+        ),
+        (
+            add_type_direct_here_subexpression_has_no_metadata,
+            add_type_cached_here_subexpression_has_no_metadata,
+            "@\"\nclass $(Get-Name) {}\n\"@"
+        ),
+        (
+            add_type_direct_here_unicode_reference_has_no_metadata,
+            add_type_cached_here_unicode_reference_has_no_metadata,
+            "@\"\nclass $é {}\n\"@"
+        ),
+        (
+            add_type_direct_here_escaped_backtick_has_no_metadata,
+            add_type_cached_here_escaped_backtick_has_no_metadata,
+            "@\"\nclass ``$name {}\n\"@"
+        ),
+    );
+
+    #[derive(Debug, PartialEq)]
+    struct ConstantMetadata {
+        code: String,
+        parameter: String,
+        command_loc: (u32, u32, usize),
+        metadata_loc: (u32, u32, usize),
+        import_count: usize,
+        apis: Vec<String>,
+    }
+
+    fn constant_metadata(tree: ScriptBlock) -> Vec<Option<ConstantMetadata>> {
+        let mut metadata = Vec::new();
+        AstNode::ScriptBlock(tree).walk(&mut |n| {
+            if let AstNode::Command(cmd) = n {
+                if cmd.name.eq_ignore_ascii_case("add-type") {
+                    metadata.push(cmd.csharp.as_deref().map(|node| {
+                        let AstNode::CSharpMemberDef(cs) = node else {
+                            panic!("expected CSharpMemberDef, got {node:?}");
+                        };
+                        ConstantMetadata {
+                            code: cs.code.clone(),
+                            parameter: cs.parameter.clone(),
+                            command_loc: (cmd.loc.line, cmd.loc.col, cmd.loc.pos),
+                            metadata_loc: (cs.loc.line, cs.loc.col, cs.loc.pos),
+                            import_count: cs.imports.len(),
+                            apis: cs.apis.clone(),
+                        }
+                    }));
+                }
+            }
+        });
+        metadata
+    }
+
+    macro_rules! constant_add_type_cases {
+        ($(($name:ident, $src:literal, $code:literal, $loc:expr)),+ $(,)?) => {
+            $(
+                #[test]
+                fn $name() {
+                    let src = $src;
+
+                    let (tree, errors) = parse(src);
+
+                    assert_eq!(errors, Vec::<String>::new());
+                    assert_eq!(constant_metadata(tree), vec![Some(ConstantMetadata {
+                        code: $code.into(),
+                        parameter: "typedefinition".into(),
+                        command_loc: $loc,
+                        metadata_loc: $loc,
+                        import_count: 0,
+                        apis: vec![],
+                    })]);
+                }
+            )+
+        };
+    }
+
+    constant_add_type_cases!(
+        (
+            add_type_direct_single_quoted_keeps_dollars,
+            "Add-Type -TypeDefinition '$name ${name} $(Get-Name) `'",
+            "$name ${name} $(Get-Name) `",
+            (1, 1, 0)
+        ),
+        (
+            add_type_cached_single_quoted_keeps_dollars,
+            "$Code = '$name ${name} $(Get-Name) `'\nAdd-Type -TypeDefinition $code",
+            "$name ${name} $(Get-Name) `",
+            (2, 1, 38)
+        ),
+        (
+            add_type_direct_single_here_keeps_dollars,
+            "Add-Type -TypeDefinition @'\n$name ${name} $(Get-Name) `\n'@",
+            "$name ${name} $(Get-Name) `",
+            (1, 1, 0)
+        ),
+        (
+            add_type_cached_single_here_keeps_dollars,
+            "$Code = @'\n$name ${name} $(Get-Name) `\n'@\nAdd-Type -TypeDefinition $code",
+            "$name ${name} $(Get-Name) `",
+            (4, 1, 42)
+        ),
+        (
+            add_type_direct_double_constant_preserves_metadata,
+            "Add-Type -TypeDefinition \"class A {}\"",
+            "class A {}",
+            (1, 1, 0)
+        ),
+        (
+            add_type_cached_double_constant_preserves_metadata,
+            "$Code = \"class A {}\"\nAdd-Type -TypeDefinition $code",
+            "class A {}",
+            (2, 1, 21)
+        ),
+        (
+            add_type_direct_double_here_constant_preserves_metadata,
+            "Add-Type -TypeDefinition @\"\nclass A {}\n\"@",
+            "class A {}",
+            (1, 1, 0)
+        ),
+        (
+            add_type_cached_double_here_constant_preserves_metadata,
+            "$Code = @\"\nclass A {}\n\"@\nAdd-Type -TypeDefinition $code",
+            "class A {}",
+            (4, 1, 25)
+        ),
+        (
+            add_type_direct_escaped_dollar_is_constant,
+            "Add-Type -TypeDefinition \"class `$name {}\"",
+            "class $name {}",
+            (1, 1, 0)
+        ),
+        (
+            add_type_cached_escaped_dollar_is_constant,
+            "$Code = \"class `$name {}\"\nAdd-Type -TypeDefinition $code",
+            "class $name {}",
+            (2, 1, 26)
+        ),
+        (
+            add_type_direct_odd_backticks_are_constant,
+            "Add-Type -TypeDefinition \"class ```$name {}\"",
+            "class `$name {}",
+            (1, 1, 0)
+        ),
+        (
+            add_type_cached_odd_backticks_are_constant,
+            "$Code = \"class ```$name {}\"\nAdd-Type -TypeDefinition $code",
+            "class `$name {}",
+            (2, 1, 28)
+        ),
+        (
+            add_type_direct_here_escaped_dollar_is_constant,
+            "Add-Type -TypeDefinition @\"\nclass `$name {}\n\"@",
+            "class `$name {}",
+            (1, 1, 0)
+        ),
+        (
+            add_type_cached_here_escaped_dollar_is_constant,
+            "$Code = @\"\nclass `$name {}\n\"@\nAdd-Type -TypeDefinition $code",
+            "class `$name {}",
+            (4, 1, 30)
+        ),
+        (
+            add_type_fresh_literal_reassignment_uses_new_metadata,
+            "$Code = 'class A {}'\n$CODE = 'class B {}'\nAdd-Type -TypeDefinition $code",
+            "class B {}",
+            (3, 1, 42)
+        ),
+        (
+            add_type_unicode_bom_uses_stripped_source_location,
+            "\u{feff}# é\n$Code = 'class A {}'\nAdd-Type -TypeDefinition $code",
+            "class A {}",
+            (3, 1, 26)
+        ),
+    );
 
     fn all_nodes(src: &str) -> Vec<AstNode> {
         let (tree, _) = parse(src);
@@ -2619,6 +3536,648 @@ public static extern IntPtr CreateThread(IntPtr a);
         assert!(
             crate::unparse_source("class C { [ValidateNotNull()] [string]$X }")
                 .contains("ValidateNotNull()")
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum InterpolationShape {
+        String {
+            raw: String,
+            value: String,
+            kind: String,
+            expandable: bool,
+            parts: Vec<InterpolationShape>,
+        },
+        Variable(String, Option<String>, String),
+        SubExpression(Vec<InterpolationShape>),
+        Number(String, Option<f64>),
+        Error(String, String),
+    }
+
+    fn interpolation_shape(node: AstNode) -> InterpolationShape {
+        match node {
+            AstNode::StringLiteral(s) => InterpolationShape::String {
+                raw: s.raw,
+                value: s.value,
+                kind: s.kind,
+                expandable: s.expandable,
+                parts: s.parts.into_iter().map(interpolation_shape).collect(),
+            },
+            AstNode::Variable(v) => InterpolationShape::Variable(v.name, v.scope, v.raw),
+            AstNode::SubExpression(s) => InterpolationShape::SubExpression(
+                s.body
+                    .statements
+                    .into_iter()
+                    .map(interpolation_shape)
+                    .collect(),
+            ),
+            AstNode::NumberLiteral(n) => InterpolationShape::Number(n.raw, n.value),
+            AstNode::ErrorNode(e) => InterpolationShape::Error(e.message, e.raw),
+            other => panic!("unexpected interpolation fixture node: {other:?}"),
+        }
+    }
+
+    fn literal_shape(
+        raw: &str,
+        value: &str,
+        kind: &str,
+        expandable: bool,
+        parts: Vec<InterpolationShape>,
+    ) -> InterpolationShape {
+        InterpolationShape::String {
+            raw: raw.into(),
+            value: value.into(),
+            kind: kind.into(),
+            expandable,
+            parts,
+        }
+    }
+
+    macro_rules! raw_interpolation_cases {
+        ($($name:ident: ($source:expr, $expected:expr)),* $(,)?) => {
+            $(
+                #[test]
+                fn $name() {
+                    let source = $source;
+                    let expected = $expected;
+
+                    let (tree, errors) = parse(source);
+
+                    assert_eq!(errors, Vec::<String>::new());
+                    assert_eq!(
+                        tree.statements.into_iter().map(interpolation_shape).collect::<Vec<_>>(),
+                        expected,
+                    );
+                }
+            )*
+        };
+    }
+
+    raw_interpolation_cases! {
+        raw_interpolation_escaped_dollar_has_no_parts: (
+            r#""`$name""#,
+            vec![literal_shape(r#""`$name""#, "$name", "double", false, vec![])]
+        ),
+        raw_interpolation_escaped_subexpression_has_no_parts: (
+            r#""`$(1)""#,
+            vec![literal_shape(r#""`$(1)""#, "$(1)", "double", false, vec![])]
+        ),
+        raw_interpolation_even_backticks_leave_variable_active: (
+            r#""``$name""#,
+            vec![literal_shape(r#""``$name""#, "`$name", "double", true, vec![
+                InterpolationShape::Variable("name".into(), None, "$name".into()),
+            ])]
+        ),
+        raw_interpolation_odd_backticks_leave_variable_literal: (
+            r#""```$name""#,
+            vec![literal_shape(r#""```$name""#, "`$name", "double", false, vec![])]
+        ),
+        raw_interpolation_four_backticks_leave_variable_active: (
+            r#""````$name""#,
+            vec![literal_shape(r#""````$name""#, "``$name", "double", true, vec![
+                InterpolationShape::Variable("name".into(), None, "$name".into()),
+            ])]
+        ),
+        raw_interpolation_mixed_escaped_and_active_references_keep_order: (
+            r#""`$skip $first ``$second ```$skipToo ${last}""#,
+            vec![literal_shape(
+                r#""`$skip $first ``$second ```$skipToo ${last}""#,
+                "$skip $first `$second `$skipToo ${last}", "double", true, vec![
+                    InterpolationShape::Variable("first".into(), None, "$first".into()),
+                    InterpolationShape::Variable("second".into(), None, "$second".into()),
+                    InterpolationShape::Variable("last".into(), None, "${last}".into()),
+                ],
+            )]
+        ),
+        raw_interpolation_unicode_continuations_and_braces_preserve_existing_grammar: (
+            r#""$a变量 $scope:náme ${变量:名} $é $ok""#,
+            vec![literal_shape(
+                r#""$a变量 $scope:náme ${变量:名} $é $ok""#,
+                "$a变量 $scope:náme ${变量:名} $é $ok", "double", true, vec![
+                    InterpolationShape::Variable("a变量".into(), None, "$a变量".into()),
+                    InterpolationShape::Variable("náme".into(), Some("scope".into()), "$scope:náme".into()),
+                    InterpolationShape::Variable("变量:名".into(), None, "${变量:名}".into()),
+                    InterpolationShape::Variable("ok".into(), None, "$ok".into()),
+                ],
+            )]
+        ),
+        raw_interpolation_unsupported_then_escaped_and_valid_dollars_do_not_duplicate: (
+            r#""$1 `$skip $ok ${end}""#,
+            vec![literal_shape(
+                r#""$1 `$skip $ok ${end}""#, "$1 $skip $ok ${end}", "double", true, vec![
+                    InterpolationShape::Variable("ok".into(), None, "$ok".into()),
+                    InterpolationShape::Variable("end".into(), None, "${end}".into()),
+                ],
+            )]
+        ),
+        raw_interpolation_unsupported_dollar_is_expandable_without_parts: (
+            r#""$é""#,
+            vec![literal_shape(r#""$é""#, "$é", "double", true, vec![])]
+        ),
+        raw_interpolation_bare_dollar_is_expandable_without_parts: (
+            r#""$""#,
+            vec![literal_shape(r#""$""#, "$", "double", true, vec![])]
+        ),
+        raw_interpolation_single_quoted_form_stays_literal: (
+            "'`$skip $name $(1) ''q'''",
+            vec![literal_shape(
+                "'`$skip $name $(1) ''q'''", "`$skip $name $(1) 'q'", "single", false, vec![],
+            )]
+        ),
+        raw_interpolation_here_single_form_stays_literal_and_trimmed: (
+            "@'\r\n\r\n`$skip $name $(1)\r\n\r\n'@",
+            vec![literal_shape(
+                "@'\r\n\r\n`$skip $name $(1)\r\n\r\n'@",
+                "`$skip $name $(1)", "here_single", false, vec![],
+            )]
+        ),
+        raw_interpolation_here_double_form_keeps_raw_value_and_active_parts: (
+            "@\"\r\n\r\n`$skip $name $(1)\r\n\r\n\"@",
+            vec![literal_shape(
+                "@\"\r\n\r\n`$skip $name $(1)\r\n\r\n\"@",
+                "`$skip $name $(1)", "here_double", true, vec![
+                    InterpolationShape::Variable("name".into(), None, "$name".into()),
+                    InterpolationShape::SubExpression(vec![
+                        InterpolationShape::Number("1".into(), Some(1.0)),
+                    ]),
+                ],
+            )]
+        ),
+        raw_interpolation_here_double_escaped_only_is_not_expandable: (
+            "@\"\n`$skip\n\"@",
+            vec![literal_shape("@\"\n`$skip\n\"@", "`$skip", "here_double", false, vec![])]
+        ),
+        raw_interpolation_here_header_dollar_is_not_in_body: (
+            "@\" $header\nplain\n\"@",
+            vec![literal_shape("@\" $header\nplain\n\"@", "plain", "here_double", false, vec![])]
+        ),
+        raw_interpolation_empty_and_sequential_subexpressions_keep_order: (
+            r#""$()$first$(1)$last";2"#,
+            vec![
+                literal_shape(r#""$()$first$(1)$last""#, "$()$first$(1)$last", "double", true, vec![
+                    InterpolationShape::SubExpression(vec![]),
+                    InterpolationShape::Variable("first".into(), None, "$first".into()),
+                    InterpolationShape::SubExpression(vec![
+                        InterpolationShape::Number("1".into(), Some(1.0)),
+                    ]),
+                    InterpolationShape::Variable("last".into(), None, "$last".into()),
+                ]),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_double_quoted_paren_keeps_fragment_and_following_statement: (
+            r#""$(")")";2"#,
+            vec![
+                literal_shape(r#""$(")")""#, r#"$(")")"#, "double", true, vec![
+                    InterpolationShape::SubExpression(vec![
+                        literal_shape(r#"")""#, ")", "double", false, vec![]),
+                    ]),
+                ]),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_single_quoted_paren_keeps_fragment_and_following_statement: (
+            r#""$(')')";2"#,
+            vec![
+                literal_shape(r#""$(')')""#, "$(')')", "double", true, vec![
+                    InterpolationShape::SubExpression(vec![
+                        literal_shape("')'", ")", "single", false, vec![]),
+                    ]),
+                ]),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_quoted_backtick_is_not_decoded_before_fragment_parse: (
+            r#""$('a`)b';1)";2"#,
+            vec![
+                literal_shape(r#""$('a`)b';1)""#, "$('a)b';1)", "double", true, vec![
+                    InterpolationShape::SubExpression(vec![
+                        literal_shape("'a`)b'", "a`)b", "single", false, vec![]),
+                        InterpolationShape::Number("1".into(), Some(1.0)),
+                    ]),
+                ]),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_doubled_inner_quotes_keep_raw_fragment_spelling: (
+            r#""$("a"")""b")";2"#,
+            vec![
+                literal_shape(r#""$("a"")""b")""#, r#"$("a")"b")"#, "double", true, vec![
+                    InterpolationShape::SubExpression(vec![
+                        literal_shape(r#""a"")""b""#, "a\")\"b", "double", false, vec![]),
+                    ]),
+                ]),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_escaped_inner_dollar_stays_literal_in_fragment: (
+            r#""$("`$name")";2"#,
+            vec![
+                literal_shape(r#""$("`$name")""#, r#"$("$name")"#, "double", true, vec![
+                    InterpolationShape::SubExpression(vec![
+                        literal_shape(r#""`$name""#, "$name", "double", false, vec![]),
+                    ]),
+                ]),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_nested_block_comment_keeps_boundary_and_legacy_fragment_parse: (
+            r#""$(<# ) " <# ) #> " #>1)";2"#,
+            vec![
+                literal_shape(
+                    r#""$(<# ) " <# ) #> " #>1)""#, r#"$(<# ) " <# ) #> " #>1)"#,
+                    "double", true, vec![
+                        InterpolationShape::SubExpression(vec![
+                            // The boundary scan nests block comments, but the
+                            // legacy fragment lexer stops at the first #>.
+                            literal_shape("\" #>1", " #>1", "double", false, vec![]),
+                        ]),
+                    ],
+                ),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_line_comment_parens_keep_following_statement: (
+            "\"$(# ) \"\r\n1)\";2",
+            vec![
+                literal_shape("\"$(# ) \"\r\n1)\"", "$(# ) \"\r\n1)", "double", true, vec![
+                    InterpolationShape::SubExpression(vec![
+                        InterpolationShape::Number("1".into(), Some(1.0)),
+                    ]),
+                ]),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_block_comment_parens_keep_fragment_and_following_statement: (
+            r#""$(<# ) " #>1)";2"#,
+            vec![
+                literal_shape(r#""$(<# ) " #>1)""#, r#"$(<# ) " #>1)"#, "double", true, vec![
+                    InterpolationShape::SubExpression(vec![
+                        InterpolationShape::Number("1".into(), Some(1.0)),
+                    ]),
+                ]),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_escaped_code_paren_keeps_local_error_and_following_statement: (
+            r#""$(`))";2"#,
+            vec![
+                literal_shape(r#""$(`))""#, "$())", "double", true, vec![
+                    InterpolationShape::SubExpression(vec![
+                        InterpolationShape::Error("unexpected Unknown \"`\"".into(), "`)".into()),
+                    ]),
+                ]),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_even_backticks_leave_subexpression_active: (
+            r#""``$(1)";2"#,
+            vec![
+                literal_shape(r#""``$(1)""#, "`$(1)", "double", true, vec![
+                    InterpolationShape::SubExpression(vec![
+                        InterpolationShape::Number("1".into(), Some(1.0)),
+                    ]),
+                ]),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_odd_backticks_leave_subexpression_literal: (
+            r#""```$(1)";2"#,
+            vec![
+                literal_shape(r#""```$(1)""#, "`$(1)", "double", false, vec![]),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_here_double_backtick_parity_keeps_only_active_references: (
+            "@\"\n``$first ```$skip $last\n\"@",
+            vec![literal_shape(
+                "@\"\n``$first ```$skip $last\n\"@", "``$first ```$skip $last",
+                "here_double", true, vec![
+                    InterpolationShape::Variable("first".into(), None, "$first".into()),
+                    InterpolationShape::Variable("last".into(), None, "$last".into()),
+                ],
+            )]
+        ),
+        raw_interpolation_here_double_unsupported_dollar_does_not_search_ahead: (
+            "@\"\n$é `$skip $a变量 ${名}\n\"@",
+            vec![literal_shape(
+                "@\"\n$é `$skip $a变量 ${名}\n\"@", "$é `$skip $a变量 ${名}",
+                "here_double", true, vec![
+                    InterpolationShape::Variable("a变量".into(), None, "$a变量".into()),
+                    InterpolationShape::Variable("名".into(), None, "${名}".into()),
+                ],
+            )]
+        ),
+        raw_interpolation_here_double_quoted_paren_keeps_following_statement: (
+            "@\"\n$(')';1)\n\"@;2",
+            vec![
+                literal_shape("@\"\n$(')';1)\n\"@", "$(')';1)", "here_double", true, vec![
+                    InterpolationShape::SubExpression(vec![
+                        literal_shape("')'", ")", "single", false, vec![]),
+                        InterpolationShape::Number("1".into(), Some(1.0)),
+                    ]),
+                ]),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_inner_here_single_keeps_parens_and_following_statement: (
+            "\"$(@'\r\n) \"\r\n'@\r\n)\";2",
+            vec![
+                literal_shape(
+                    "\"$(@'\r\n) \"\r\n'@\r\n)\"", "$(@'\r\n) \"\r\n'@\r\n)",
+                    "double", true, vec![
+                        InterpolationShape::SubExpression(vec![
+                            literal_shape("@'\r\n) \"\r\n'@", ") \"", "here_single", false, vec![]),
+                        ]),
+                    ],
+                ),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_inner_here_double_keeps_parens_and_following_statement: (
+            "\"$(@\"\n) '\n\"@\n)\";2",
+            vec![
+                literal_shape(
+                    "\"$(@\"\n) '\n\"@\n)\"", "$(@\"\n) '\n\"@\n)", "double", true, vec![
+                        InterpolationShape::SubExpression(vec![
+                            literal_shape("@\"\n) '\n\"@", ") '", "here_double", false, vec![]),
+                        ]),
+                    ],
+                ),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+        raw_interpolation_unclosed_subexpression_keeps_available_numbers: (
+            "\"$(1;2",
+            vec![literal_shape("\"$(1;2", "$(1;2", "double", true, vec![
+                InterpolationShape::SubExpression(vec![
+                    InterpolationShape::Number("1".into(), Some(1.0)),
+                    InterpolationShape::Number("2".into(), Some(2.0)),
+                ]),
+            ])]
+        ),
+        raw_interpolation_unclosed_fragment_quote_is_not_an_outer_delimiter: (
+            "\"$(1;\"",
+            vec![literal_shape("\"$(1;\"", "$(1;\"", "double", true, vec![
+                InterpolationShape::SubExpression(vec![
+                    InterpolationShape::Number("1".into(), Some(1.0)),
+                    literal_shape("\"", "", "double", false, vec![]),
+                ]),
+            ])]
+        ),
+        raw_interpolation_unterminated_here_body_keeps_available_subexpression: (
+            "@\"\r\n$(1",
+            vec![literal_shape("@\"\r\n$(1", "$(1", "here_double", true, vec![
+                InterpolationShape::SubExpression(vec![
+                    InterpolationShape::Number("1".into(), Some(1.0)),
+                ]),
+            ])]
+        ),
+        raw_interpolation_unterminated_here_inline_marker_is_body_text: (
+            "@\"\n$(1;\"@",
+            vec![literal_shape("@\"\n$(1;\"@", "$(1;\"@", "here_double", true, vec![
+                InterpolationShape::SubExpression(vec![
+                    InterpolationShape::Number("1".into(), Some(1.0)),
+                    literal_shape("\"@", "@", "double", false, vec![]),
+                ]),
+            ])]
+        ),
+        raw_interpolation_unclosed_fragment_keeps_local_error_without_closing_token: (
+            "\"$(1;[",
+            vec![literal_shape("\"$(1;[", "$(1;[", "double", true, vec![
+                InterpolationShape::SubExpression(vec![
+                    InterpolationShape::Number("1".into(), Some(1.0)),
+                    InterpolationShape::Error("unexpected LBracket \"[\"".into(), "[".into()),
+                ]),
+            ])]
+        ),
+        raw_interpolation_unclosed_fragment_preserves_raw_trailing_backtick: (
+            "\"$(1;`",
+            vec![literal_shape("\"$(1;`", "$(1;", "double", true, vec![
+                InterpolationShape::SubExpression(vec![
+                    InterpolationShape::Number("1".into(), Some(1.0)),
+                    InterpolationShape::Error("unexpected Unknown \"`\"".into(), "`".into()),
+                ]),
+            ])]
+        ),
+        raw_interpolation_closed_malformed_fragment_keeps_local_error_and_outer_statement: (
+            r#""$(1;[)";2"#,
+            vec![
+                literal_shape(r#""$(1;[)""#, "$(1;[)", "double", true, vec![
+                    InterpolationShape::SubExpression(vec![
+                        InterpolationShape::Number("1".into(), Some(1.0)),
+                        InterpolationShape::Error("unexpected LBracket \"[\"".into(), "[".into()),
+                    ]),
+                ]),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        ),
+    }
+
+    #[test]
+    fn raw_interpolation_bom_unicode_crlf_keeps_literal_and_coarse_fragment_locations() {
+        let source = "\u{feff}\r\n  \"é`$skip $a变量 $(1)\r\n終\";2";
+
+        let (tree, errors) = parse(source);
+
+        assert_eq!(errors, Vec::<String>::new());
+        let [AstNode::StringLiteral(s), AstNode::NumberLiteral(tail)] = tree.statements.as_slice()
+        else {
+            panic!("expected string and following number, got {tree:?}");
+        };
+        let [AstNode::Variable(var), AstNode::SubExpression(sub)] = s.parts.as_slice() else {
+            panic!("expected variable and subexpression, got {:?}", s.parts);
+        };
+        let [AstNode::NumberLiteral(num)] = sub.body.statements.as_slice() else {
+            panic!("expected fragment number, got {:?}", sub.body);
+        };
+        let locations = [
+            &tree.loc,
+            &s.loc,
+            &var.loc,
+            &sub.loc,
+            &sub.body.loc,
+            &num.loc,
+            &tail.loc,
+        ]
+        .map(|loc| (loc.line, loc.col, loc.pos));
+        // v1 offsets exclude the BOM. Variable/subexpression nodes inherit the
+        // outer location; the fragment body and number keep local locations.
+        assert_eq!(
+            locations,
+            [
+                (1, 1, 0),
+                (2, 3, 4),
+                (2, 3, 4),
+                (2, 3, 4),
+                (1, 1, 0),
+                (1, 1, 0),
+                (3, 4, 34),
+            ]
+        );
+        assert_eq!(
+            tree.statements
+                .into_iter()
+                .map(interpolation_shape)
+                .collect::<Vec<_>>(),
+            vec![
+                literal_shape(
+                    "\"é`$skip $a变量 $(1)\r\n終\"",
+                    "é$skip $a变量 $(1)\r\n終",
+                    "double",
+                    true,
+                    vec![
+                        InterpolationShape::Variable("a变量".into(), None, "$a变量".into()),
+                        InterpolationShape::SubExpression(vec![InterpolationShape::Number(
+                            "1".into(),
+                            Some(1.0),
+                        )]),
+                    ],
+                ),
+                InterpolationShape::Number("2".into(), Some(2.0)),
+            ]
+        );
+    }
+
+    fn interpolation_depth_shape(tree: ScriptBlock) -> (usize, Vec<String>) {
+        let mut functions = 0;
+        let mut shape = Vec::new();
+        AstNode::ScriptBlock(tree).walk(&mut |node| match node {
+            AstNode::ScriptBlock(_) => {}
+            AstNode::FunctionDefinition(_) => functions += 1,
+            AstNode::StringLiteral(s) => shape.push(format!("{} {}", s.kind, s.raw)),
+            AstNode::SubExpression(_) => shape.push("subexpression".into()),
+            AstNode::NumberLiteral(n) => shape.push(format!("number {}", n.raw)),
+            AstNode::ErrorNode(e) => shape.push(format!("error {}", e.message)),
+            _ => panic!("unexpected node in interpolation depth fixture: {node:?}"),
+        });
+        (functions, shape)
+    }
+
+    #[test]
+    fn interpolation_combined_depth_100_preserves_number_in_fragment() {
+        // 96 function statements + string statement/primary + fragment
+        // statement/primary reach exactly 100, which is still permitted.
+        let src = format!("{}\"$(1)\"{}", "function f {".repeat(96), "}".repeat(96));
+
+        let (tree, errors) = parse(&src);
+
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(
+            interpolation_depth_shape(tree),
+            (
+                96,
+                vec![
+                    "double \"$(1)\"".into(),
+                    "subexpression".into(),
+                    "number 1".into(),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn interpolation_combined_depth_101_keeps_expression_error_in_fragment() {
+        // Function bodies add statement depth without retaining the large
+        // expression-precedence frames at every level. This stays bounded on
+        // the ordinary test stack: string depth 99, fragment statement 100,
+        // fragment primary 101 (the first rejected entry).
+        let src = format!("{}\"$(1)\"{}", "function f {".repeat(97), "}".repeat(97));
+
+        let (tree, errors) = parse(&src);
+
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(
+            interpolation_depth_shape(tree),
+            (
+                97,
+                vec![
+                    "double \"$(1)\"".into(),
+                    "subexpression".into(),
+                    "error expression nested too deeply".into(),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn here_interpolation_statement_depth_101_keeps_error_local_and_parses_next_statement() {
+        // The enclosing string reaches 100; entering the fragment statement
+        // crosses the limit. Its latch and diagnostics must stay in that parser.
+        let src = format!(
+            "{}@\"\n$(1)\n\"@{}\n2",
+            "function f {".repeat(98),
+            "}".repeat(98)
+        );
+
+        let (tree, errors) = parse(&src);
+
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(
+            interpolation_depth_shape(tree),
+            (
+                98,
+                vec![
+                    "here_double @\"\n$(1)\n\"@".into(),
+                    "subexpression".into(),
+                    "error statement nested too deeply".into(),
+                    "number 2".into(),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn nested_interpolation_combined_depth_100_preserves_innermost_number() {
+        // Each detached fragment must inherit depth, including the fragment
+        // inside the double-quoted string inside this here-string's fragment.
+        let src = format!(
+            "{}@\"\n$(\"$(1)\")\n\"@{}",
+            "function f {".repeat(94),
+            "}".repeat(94)
+        );
+
+        let (tree, errors) = parse(&src);
+
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(
+            interpolation_depth_shape(tree),
+            (
+                94,
+                vec![
+                    "here_double @\"\n$(\"$(1)\")\n\"@".into(),
+                    "subexpression".into(),
+                    "double \"$(1)\"".into(),
+                    "subexpression".into(),
+                    "number 1".into(),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn nested_interpolation_combined_depth_101_keeps_innermost_expression_error() {
+        let src = format!(
+            "{}@\"\n$(\"$(1)\")\n\"@{}",
+            "function f {".repeat(95),
+            "}".repeat(95)
+        );
+
+        let (tree, errors) = parse(&src);
+
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(
+            interpolation_depth_shape(tree),
+            (
+                95,
+                vec![
+                    "here_double @\"\n$(\"$(1)\")\n\"@".into(),
+                    "subexpression".into(),
+                    "double \"$(1)\"".into(),
+                    "subexpression".into(),
+                    "error expression nested too deeply".into(),
+                ],
+            )
         );
     }
 

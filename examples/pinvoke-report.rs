@@ -14,6 +14,14 @@
 //! library, return type, name, and typed parameters) and the types, methods,
 //! and fields the C# declares, from [`poshtree::v2::csharp::csharp_symbols`].
 //! It only reads the script; nothing is rewritten.
+//!
+//! With the C# front-end, signature types preserve source spelling, including
+//! qualified and generic names, array ranks, nullable and pointer suffixes, and
+//! internal whitespace/comments. Attributes, declaration/parameter modifiers,
+//! and parameter defaults are excluded. This is syntactic extraction, not
+//! semantic type validation or resolution: reported types need not be valid
+//! P/Invoke marshalling types. Only declarations recognized by the C# parser
+//! are reported; unsupported anchored type syntax is shown as an empty type.
 
 use std::process::ExitCode;
 
@@ -140,6 +148,36 @@ fn api_label(kind: DeclKind) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_with_embedded_csharp_prints_full_types_without_declaration_extras() {
+        let source = r#"# 前置き 🦀
+Add-Type -TypeDefinition @'
+public unsafe class Native {
+    [DllImport("native.dll")]
+    public static extern global::Native.Box<System.Collections.Generic.List<byte?[,]>>[] Go(
+        [In] ref byte /* element */ [] data,
+        out int? result,
+        byte* pointer,
+        [Optional] in Native.Handle handle = DefaultHandle,
+        params int[][] rest);
+}
+'@
+"#;
+
+        let actual = report(source);
+
+        let (_, signatures_and_declarations) = actual
+            .split_once("  P/Invoke signatures:\n")
+            .expect("report should contain a P/Invoke signature section");
+        let (signatures, _) = signatures_and_declarations
+            .split_once("  declared:\n")
+            .expect("signature section should end before declarations");
+        assert_eq!(
+            signatures,
+            "    native.dll  global::Native.Box<System.Collections.Generic.List<byte?[,]>>[] Go(byte /* element */ [] data, int? result, byte* pointer, Native.Handle handle, int[][] rest)\n"
+        );
+    }
 
     #[test]
     fn extracts_both_pinvoke_signatures() {

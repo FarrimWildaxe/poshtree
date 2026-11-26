@@ -12,25 +12,23 @@
 //! source bytes did this node come from?" and get an answer that includes the
 //! original spacing and comments.
 //!
-//! Reusing the v1 parser is deliberate: forking 2,500 lines of grammar to
-//! thread token indices through it would be a large, bug-prone change, and the
-//! byte offsets v1 already records on every node ([`Location::pos`](crate::v1::ast::Location::pos)) are
-//! enough to recover the ranges after the fact.
+//! This bridge provides token footprints for callers that still use the typed
+//! v1 AST. It recovers ranges from the byte offsets v1 records on every node
+//! ([`Location::pos`](crate::v1::ast::Location::pos)), rather than changing that
+//! AST's representation.
 //!
-//! # v1 coupling, and how it ends
+//! # Feature-gated v1 coupling
 //!
-//! This module is the only part of `v2` that depends on `v1` (the lexer,
-//! spans, trivia, and edits stand alone; their classification tables are
-//! v2-owned copies). The dependency is the price of getting per-node ranges
-//! without a parser fork. The planned endgame is a native v2 parser that
-//! records [`TokenRange`]s directly while parsing v2 tokens; during that
-//! port this module doubles as a differential-testing oracle (the native
-//! parser's ranges must match the correlated ones), and once the port is
-//! trusted, this module is deleted together with `v1`.
+//! This module requires both `v1` and `v2`; it is the only part of `v2` that
+//! depends on `v1`. The native [`super::parse`] parser records
+//! [`TokenRange`]s directly while parsing v2 tokens, and the native formatter
+//! also works with `v2` alone. **This bridge and its `v2` re-exports are
+//! deprecated in 0.5 documentation only** and remain repair-only throughout
+//! 0.5. The v1 bridge and its `v2` re-exports will not be removed before 0.6.0.
 //!
 //! # The guarantee
 //!
-//! For any input, including malformed input, unparsing the root node
+//! For any input, including malformed input, reconstructing the whole tree
 //! reproduces the source byte-for-byte:
 //!
 //! ```
@@ -43,7 +41,20 @@
 //!
 //! [`Tree::unparse_lossless`] is just [`super::reconstruct`] over the whole
 //! token vector; the per-node ranges are what make *partial* lossless
-//! unparsing (one statement, one command) possible.
+//! unparsing (one statement, one command) possible. Exact reconstruction of
+//! retained tokens does not establish semantic equivalence after an edit or
+//! formatting pass.
+//!
+//! # Coordinate systems
+//!
+//! [`TreeNode::pos`] preserves the v1 AST's byte offset in the source with
+//! one leading UTF-8 BOM removed, if present. It is not a character index.
+//! Token spans and [`TreeNode::source_span`] instead address the original
+//! input, including the BOM; `source_span` also includes attached trivia.
+//! The bridge translates positions only for its internal token lookups:
+//! retaining a BOM as trivia does not make token offsets equal to v1 offsets.
+//! Without a leading BOM, both use the same byte coordinate system, though a
+//! node's position and its trivia-inclusive source span need not start together.
 //!
 //! # How ranges are assigned
 //!
@@ -57,7 +68,7 @@
 //! Interpolation nodes inside an expandable string (the `$x` in `"a $x b"`)
 //! are a special case: v1 stamps them with an offset *inside* the string
 //! token, which no top-level token starts at. Such nodes get an empty range
-//! (`first == last`) pointing at the enclosing string token, and the string
+//! (`first == end`) pointing at the enclosing string token, and the string
 //! token itself carries their bytes. This keeps the byte-for-byte guarantee:
 //! those bytes are emitted once, by the string token.
 
@@ -76,7 +87,8 @@ pub struct TreeNode {
     pub label: &'static str,
     /// Scalar field summary for debugging, e.g. `name="Get-Item"`.
     pub scalars: String,
-    /// Byte offset of the node, as recorded by the v1 parser.
+    /// Byte offset recorded by v1 in the source with one leading UTF-8 BOM
+    /// removed, if present; not a character index or an original-input span.
     pub pos: usize,
     /// Tokens this node spans.
     pub range: TokenRange,
@@ -99,6 +111,9 @@ impl TreeNode {
 
     /// The byte span of this node's tokens, trivia included, or `None` for a
     /// node with an empty range.
+    ///
+    /// Offsets address the original input, including any leading BOM, unlike
+    /// [`TreeNode::pos`], which preserves v1's BOM-stripped byte coordinates.
     pub fn source_span(&self, tree: &Tree) -> Option<Span> {
         let toks = self.tokens(tree);
         match (toks.first(), toks.last()) {
@@ -199,15 +214,27 @@ impl Tree {
 /// Parses `src` and returns a [`Tree`]: the v1 AST shape with v2 tokens and a
 /// token range on every node.
 ///
+/// **Deprecated in 0.5 documentation only**, including the
+/// `poshtree::v2::parse_with_tokens` alias. This constructor still requires both
+/// `v1` and `v2`. For native ancestor-aware traversal use [`super::parse`] and
+/// [`super::Node::walk_with_ancestors`] with native spans or token ranges.
+/// Neither supplies the typed v1 nodes, scalar summaries, or trivia-inclusive
+/// footprints provided by the bridge. For exact token replay use
+/// [`super::reconstruct`]; for edits to original source, use
+/// [`super::apply_edits`].
+///
 /// The parse itself is the v1 parser, so error recovery and node coverage are
 /// identical to [`crate::v1::parser::parse`]; this adds the token stream and
 /// the per-node ranges on top.
+///
+/// Node positions preserve v1's byte coordinates after removing one leading
+/// BOM, if present. Token spans and [`TreeNode::source_span`] use the original
+/// input's byte coordinates; source spans include attached trivia.
 pub fn parse_with_tokens(src: &str) -> Tree {
     let tokens = lex(src).tokens;
-    // The v1 parser strips a BOM internally and works in the resulting byte
-    // space; v2 keeps the BOM as leading trivia on the first token, so token
-    // start offsets already match v1's positions (a BOM contributes trivia,
-    // not a token start). No offset translation is needed.
+    // v1 positions exclude the leading BOM, while v2 token spans address the
+    // original input. Translate only the builder's lookups, not public positions.
+    let bom_offset = src.len() - crate::encoding::strip_bom(src).len();
     let (ast, errors) = v1_parse(src);
 
     // Offset of each significant (non-Eof) token, for mapping node.pos ->
@@ -216,6 +243,7 @@ pub fn parse_with_tokens(src: &str) -> Tree {
     let builder = Builder {
         tokens: &tokens,
         starts: &starts,
+        bom_offset,
     };
     let root_ast = AstNode::ScriptBlock(ast);
     let mut root = builder.build(&root_ast);
@@ -232,6 +260,7 @@ pub fn parse_with_tokens(src: &str) -> Tree {
 struct Builder<'a> {
     tokens: &'a [Token],
     starts: &'a [usize],
+    bom_offset: usize,
 }
 
 impl Builder<'_> {
@@ -253,6 +282,7 @@ impl Builder<'_> {
     /// whitespace before the construct), so its range still begins at its
     /// first real token instead of collapsing to empty.
     fn token_at_or_after(&self, pos: usize) -> Option<usize> {
+        let pos = pos + self.bom_offset;
         match self.starts.binary_search(&pos) {
             Ok(i) => Some(i),
             Err(i) => (i < self.starts.len()).then_some(i),
@@ -263,6 +293,7 @@ impl Builder<'_> {
     /// start). Such a node is an in-string interpolation child whose bytes
     /// belong to the enclosing string token; it gets an empty range.
     fn inside_a_token(&self, pos: usize) -> bool {
+        let pos = pos + self.bom_offset;
         self.tokens
             .iter()
             .any(|t| t.span.start < pos && pos < t.span.end)
@@ -351,6 +382,7 @@ impl Builder<'_> {
     /// The deepest enclosing token index for an offset that does not start a
     /// token (it falls strictly inside a token's span).
     fn containing_token(&self, pos: usize) -> Option<usize> {
+        let pos = pos + self.bom_offset;
         self.tokens
             .iter()
             .position(|t| t.span.start <= pos && pos < t.span.end)
@@ -409,22 +441,24 @@ mod tests {
     #[test]
     fn node_unparse_recovers_exact_source_with_trivia() {
         let src = "$x = Get-WmiObject  -Class  Win32_BIOS   # keep\n";
+
         let tree = parse_with_tokens(src);
 
-        // The command node should reconstruct to its own source slice,
-        // including the irregular internal spacing the author used.
-        let mut command_text = None;
-        tree.root.walk(&mut |n| {
-            if n.label == "Command" {
-                command_text = Some(n.unparse_lossless(&tree));
-            }
-        });
-        let text = command_text.expect("a Command node");
-        assert!(text.contains("Get-WmiObject"));
-        assert!(text.contains("-Class"));
-        assert!(text.contains("Win32_BIOS"));
-        // internal double spaces are preserved, since we slice real tokens
-        assert!(text.contains("Get-WmiObject  -Class  Win32_BIOS"));
+        let commands: Vec<_> = zipped_footprints(&tree)
+            .into_iter()
+            .filter(|footprint| footprint.labels.0 == "Command")
+            .collect();
+        assert_eq!(
+            commands,
+            vec![ZippedFootprint {
+                labels: ("Command", "Command"),
+                positions: (5, 5),
+                range: TokenRange { first: 2, end: 6 },
+                first_token_span: Some(Span { start: 5, end: 18 }),
+                source_span: Some(Span { start: 5, end: 48 }),
+                text: "Get-WmiObject  -Class  Win32_BIOS   # keep\n".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -467,9 +501,39 @@ mod tests {
 
     #[test]
     fn errors_are_surfaced_from_v1() {
-        // A bare closing brace makes the v1 parser recover; the tree still
-        // round-trips and the error is visible.
-        let tree = parse_with_tokens("}\n");
+        let src = "}\n";
+
+        let tree = parse_with_tokens(src);
+
+        let mut errors = Vec::new();
+        tree.walk_zipped(&mut |ast, node, _| {
+            if let AstNode::ErrorNode(error) = ast {
+                errors.push((
+                    error.message.as_str(),
+                    error.raw.as_str(),
+                    (error.loc.line, error.loc.col, error.loc.pos),
+                    node.label,
+                    node.pos,
+                    node.range,
+                    node.source_span(&tree),
+                    node.unparse_lossless(&tree),
+                ));
+            }
+        });
+        assert_eq!(tree.errors, vec!["unexpected RBrace \"}\""]);
+        assert_eq!(
+            errors,
+            vec![(
+                "unexpected RBrace \"}\"",
+                "}",
+                (1, 1, 0),
+                "ErrorNode",
+                0,
+                TokenRange { first: 0, end: 2 },
+                Some(Span { start: 0, end: 2 }),
+                "}\n".to_string(),
+            )]
+        );
         assert_eq!(tree.unparse_lossless(), "}\n");
     }
 
@@ -576,6 +640,308 @@ mod tests {
         assert_eq!(tree.tokens[commands[0].1].value, "Get-WmiObject");
         assert_eq!(commands[1].0, "Out-Null");
         assert_eq!(tree.tokens[commands[1].1].value, "Out-Null");
+    }
+
+    #[test]
+    fn parse_with_tokens_bom_unicode_children_keep_v1_positions_and_original_spans() {
+        use crate::v1::ast::NodeInfo;
+
+        let src = "\u{feff}Get-Item 'ż'\r\nOut-Null\n";
+
+        let tree = parse_with_tokens(src);
+
+        let mut pairs = Vec::new();
+        tree.walk_zipped(&mut |ast, node, _| pairs.push((ast, node)));
+        let children: Vec<_> = pairs
+            .into_iter()
+            .filter(|(ast, _)| matches!(ast, AstNode::Command(_) | AstNode::StringLiteral(_)))
+            .map(|(ast, node)| {
+                (
+                    ast.label(),
+                    node.label,
+                    ast.loc().pos,
+                    node.pos,
+                    node.range,
+                    node.tokens(&tree).first().map(|token| token.span),
+                    node.source_span(&tree),
+                )
+            })
+            .collect();
+        assert_eq!(
+            children,
+            vec![
+                (
+                    "Command",
+                    "Command",
+                    0,
+                    0,
+                    TokenRange { first: 0, end: 2 },
+                    Some(Span { start: 3, end: 11 }),
+                    Some(Span { start: 0, end: 18 }),
+                ),
+                (
+                    "StringLiteral",
+                    "StringLiteral",
+                    9,
+                    9,
+                    TokenRange { first: 1, end: 2 },
+                    Some(Span { start: 12, end: 16 }),
+                    Some(Span { start: 12, end: 18 }),
+                ),
+                (
+                    "Command",
+                    "Command",
+                    15,
+                    15,
+                    TokenRange { first: 2, end: 4 },
+                    Some(Span { start: 18, end: 26 }),
+                    Some(Span { start: 18, end: 27 }),
+                ),
+            ]
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ZippedFootprint {
+        labels: (&'static str, &'static str),
+        positions: (usize, usize),
+        range: TokenRange,
+        first_token_span: Option<Span>,
+        source_span: Option<Span>,
+        text: String,
+    }
+
+    fn zipped_footprints(tree: &Tree) -> Vec<ZippedFootprint> {
+        use crate::v1::ast::NodeInfo;
+
+        let mut footprints = Vec::new();
+        tree.walk_zipped(&mut |ast, node, _| {
+            footprints.push(ZippedFootprint {
+                labels: (ast.label(), node.label),
+                positions: (ast.loc().pos, node.pos),
+                range: node.range,
+                first_token_span: node.tokens(tree).first().map(|token| token.span),
+                source_span: node.source_span(tree),
+                text: node.unparse_lossless(tree),
+            });
+        });
+        footprints
+    }
+
+    #[test]
+    fn parse_with_tokens_bom_ascii_keeps_child_ranges_and_original_footprints() {
+        let src = "\u{feff}Get-Item 'x'\nOut-Null\n";
+
+        let tree = parse_with_tokens(src);
+
+        assert_eq!(
+            zipped_footprints(&tree),
+            vec![
+                ZippedFootprint {
+                    labels: ("ScriptBlock", "ScriptBlock"),
+                    positions: (0, 0),
+                    range: TokenRange { first: 0, end: 4 },
+                    first_token_span: Some(Span { start: 3, end: 11 }),
+                    source_span: Some(Span { start: 0, end: 25 }),
+                    text: "\u{feff}Get-Item 'x'\nOut-Null\n".to_string(),
+                },
+                ZippedFootprint {
+                    labels: ("Command", "Command"),
+                    positions: (0, 0),
+                    range: TokenRange { first: 0, end: 2 },
+                    first_token_span: Some(Span { start: 3, end: 11 }),
+                    source_span: Some(Span { start: 0, end: 16 }),
+                    text: "\u{feff}Get-Item 'x'\n".to_string(),
+                },
+                ZippedFootprint {
+                    labels: ("StringLiteral", "StringLiteral"),
+                    positions: (9, 9),
+                    range: TokenRange { first: 1, end: 2 },
+                    first_token_span: Some(Span { start: 12, end: 15 }),
+                    source_span: Some(Span { start: 12, end: 16 }),
+                    text: "'x'\n".to_string(),
+                },
+                ZippedFootprint {
+                    labels: ("Command", "Command"),
+                    positions: (13, 13),
+                    range: TokenRange { first: 2, end: 4 },
+                    first_token_span: Some(Span { start: 16, end: 24 }),
+                    source_span: Some(Span { start: 16, end: 25 }),
+                    text: "Out-Null\n".to_string(),
+                },
+            ]
+        );
+        assert_eq!(tree.unparse_lossless(), src);
+    }
+
+    #[test]
+    fn parse_with_tokens_unicode_without_bom_keeps_byte_positions_and_ranges() {
+        let src = "Get-Item 'ż'\r\nOut-Null\n";
+
+        let tree = parse_with_tokens(src);
+
+        assert_eq!(
+            zipped_footprints(&tree),
+            vec![
+                ZippedFootprint {
+                    labels: ("ScriptBlock", "ScriptBlock"),
+                    positions: (0, 0),
+                    range: TokenRange { first: 0, end: 4 },
+                    first_token_span: Some(Span { start: 0, end: 8 }),
+                    source_span: Some(Span { start: 0, end: 24 }),
+                    text: "Get-Item 'ż'\r\nOut-Null\n".to_string(),
+                },
+                ZippedFootprint {
+                    labels: ("Command", "Command"),
+                    positions: (0, 0),
+                    range: TokenRange { first: 0, end: 2 },
+                    first_token_span: Some(Span { start: 0, end: 8 }),
+                    source_span: Some(Span { start: 0, end: 15 }),
+                    text: "Get-Item 'ż'\r\n".to_string(),
+                },
+                ZippedFootprint {
+                    labels: ("StringLiteral", "StringLiteral"),
+                    positions: (9, 9),
+                    range: TokenRange { first: 1, end: 2 },
+                    first_token_span: Some(Span { start: 9, end: 13 }),
+                    source_span: Some(Span { start: 9, end: 15 }),
+                    text: "'ż'\r\n".to_string(),
+                },
+                ZippedFootprint {
+                    labels: ("Command", "Command"),
+                    positions: (15, 15),
+                    range: TokenRange { first: 2, end: 4 },
+                    first_token_span: Some(Span { start: 15, end: 23 }),
+                    source_span: Some(Span { start: 15, end: 24 }),
+                    text: "Out-Null\n".to_string(),
+                },
+            ]
+        );
+        assert_eq!(tree.unparse_lossless(), src);
+    }
+
+    #[test]
+    fn parse_with_tokens_leading_comment_and_whitespace_keep_non_bom_footprints() {
+        let src = "  <# h #> Get-Item 'x'\n";
+
+        let tree = parse_with_tokens(src);
+
+        assert_eq!(
+            zipped_footprints(&tree),
+            vec![
+                ZippedFootprint {
+                    labels: ("ScriptBlock", "ScriptBlock"),
+                    positions: (10, 10),
+                    range: TokenRange { first: 0, end: 3 },
+                    first_token_span: Some(Span { start: 10, end: 18 }),
+                    source_span: Some(Span { start: 0, end: 23 }),
+                    text: "  <# h #> Get-Item 'x'\n".to_string(),
+                },
+                ZippedFootprint {
+                    labels: ("Command", "Command"),
+                    positions: (10, 10),
+                    range: TokenRange { first: 0, end: 3 },
+                    first_token_span: Some(Span { start: 10, end: 18 }),
+                    source_span: Some(Span { start: 0, end: 23 }),
+                    text: "  <# h #> Get-Item 'x'\n".to_string(),
+                },
+                ZippedFootprint {
+                    labels: ("StringLiteral", "StringLiteral"),
+                    positions: (19, 19),
+                    range: TokenRange { first: 1, end: 3 },
+                    first_token_span: Some(Span { start: 19, end: 22 }),
+                    source_span: Some(Span { start: 19, end: 23 }),
+                    text: "'x'\n".to_string(),
+                },
+            ]
+        );
+        assert_eq!(tree.unparse_lossless(), src);
+    }
+
+    #[test]
+    fn parse_with_tokens_bom_before_comment_and_whitespace_keeps_v1_positions() {
+        let src = "\u{feff}  <# h #> Get-Item 'x'\n";
+
+        let tree = parse_with_tokens(src);
+
+        assert_eq!(
+            zipped_footprints(&tree),
+            vec![
+                ZippedFootprint {
+                    labels: ("ScriptBlock", "ScriptBlock"),
+                    positions: (10, 10),
+                    range: TokenRange { first: 0, end: 3 },
+                    first_token_span: Some(Span { start: 13, end: 21 }),
+                    source_span: Some(Span { start: 0, end: 26 }),
+                    text: "\u{feff}  <# h #> Get-Item 'x'\n".to_string(),
+                },
+                ZippedFootprint {
+                    labels: ("Command", "Command"),
+                    positions: (10, 10),
+                    range: TokenRange { first: 0, end: 3 },
+                    first_token_span: Some(Span { start: 13, end: 21 }),
+                    source_span: Some(Span { start: 0, end: 26 }),
+                    text: "\u{feff}  <# h #> Get-Item 'x'\n".to_string(),
+                },
+                ZippedFootprint {
+                    labels: ("StringLiteral", "StringLiteral"),
+                    positions: (19, 19),
+                    range: TokenRange { first: 1, end: 3 },
+                    first_token_span: Some(Span { start: 22, end: 25 }),
+                    source_span: Some(Span { start: 22, end: 26 }),
+                    text: "'x'\n".to_string(),
+                },
+            ]
+        );
+        assert_eq!(tree.unparse_lossless(), src);
+    }
+
+    #[test]
+    fn parse_with_tokens_empty_source_keeps_root_and_eof_at_zero() {
+        let src = "";
+
+        let tree = parse_with_tokens(src);
+
+        assert_eq!(
+            zipped_footprints(&tree),
+            vec![ZippedFootprint {
+                labels: ("ScriptBlock", "ScriptBlock"),
+                positions: (0, 0),
+                range: TokenRange { first: 0, end: 1 },
+                first_token_span: Some(Span { start: 0, end: 0 }),
+                source_span: Some(Span { start: 0, end: 0 }),
+                text: "".to_string(),
+            }]
+        );
+        assert_eq!(
+            (tree.tokens.len(), tree.tokens[0].kind, tree.tokens[0].span),
+            (1, crate::v2::TokenKind::Eof, Span { start: 0, end: 0 })
+        );
+        assert_eq!(tree.unparse_lossless(), "");
+    }
+
+    #[test]
+    fn parse_with_tokens_bom_only_keeps_root_at_zero_and_eof_in_original_input() {
+        let src = "\u{feff}";
+
+        let tree = parse_with_tokens(src);
+
+        assert_eq!(
+            zipped_footprints(&tree),
+            vec![ZippedFootprint {
+                labels: ("ScriptBlock", "ScriptBlock"),
+                positions: (0, 0),
+                range: TokenRange { first: 0, end: 1 },
+                first_token_span: Some(Span { start: 3, end: 3 }),
+                source_span: Some(Span { start: 0, end: 3 }),
+                text: "\u{feff}".to_string(),
+            }]
+        );
+        assert_eq!(
+            (tree.tokens.len(), tree.tokens[0].kind, tree.tokens[0].span),
+            (1, crate::v2::TokenKind::Eof, Span { start: 3, end: 3 })
+        );
+        assert_eq!(tree.unparse_lossless(), "\u{feff}");
     }
 
     /// Ancestor paths answer context questions ("is this variable inside a

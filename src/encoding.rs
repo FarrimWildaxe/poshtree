@@ -22,13 +22,14 @@ enum Endian {
 }
 
 fn decode_utf16(bytes: &[u8], endian: Endian) -> String {
-    // A trailing odd byte cannot form a code unit; `chunks_exact` drops it so
+    // A trailing odd byte cannot form a code unit; ignore the remainder so
     // that truncated input still decodes instead of failing outright.
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| match endian {
-            Endian::Little => u16::from_le_bytes([c[0], c[1]]),
-            Endian::Big => u16::from_be_bytes([c[0], c[1]]),
+    let (pairs, _) = bytes.as_chunks::<2>();
+    let units: Vec<u16> = pairs
+        .iter()
+        .map(|&pair| match endian {
+            Endian::Little => u16::from_le_bytes(pair),
+            Endian::Big => u16::from_be_bytes(pair),
         })
         .collect();
     // Lossy so an unpaired surrogate becomes U+FFFD rather than rejecting the
@@ -142,5 +143,149 @@ mod tests {
     fn bomless_utf16le_detected_by_nul_pattern() {
         let data = utf16le("$path = 'C:\\temp'");
         assert_eq!(decode_bytes(&data), "$path = 'C:\\temp'");
+    }
+
+    #[test]
+    fn decode_bytes_empty_input_returns_empty() {
+        let data = [];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn decode_bytes_utf8_bom_only_returns_empty() {
+        let data = [0xEF, 0xBB, 0xBF];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn decode_bytes_utf16le_bom_only_returns_empty() {
+        let data = [0xFF, 0xFE];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn decode_bytes_utf16be_bom_only_returns_empty() {
+        let data = [0xFE, 0xFF];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn decode_bytes_utf16le_lone_payload_byte_is_discarded() {
+        let data = [0xFF, 0xFE, 0x41];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn decode_bytes_utf16be_lone_payload_byte_is_discarded() {
+        let data = [0xFE, 0xFF, 0x41];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn decode_bytes_utf16le_odd_payload_preserves_complete_units() {
+        let data = [0xFF, 0xFE, 0x41, 0x00, 0xAC, 0x20, 0x42];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "A\u{20ac}");
+    }
+
+    #[test]
+    fn decode_bytes_utf16be_odd_payload_preserves_complete_units() {
+        let data = [0xFE, 0xFF, 0x00, 0x41, 0x20, 0xAC, 0x42];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "A\u{20ac}");
+    }
+
+    #[test]
+    fn decode_bytes_utf16le_surrogate_pair_decodes_supplementary_character() {
+        let data = [0xFF, 0xFE, 0x3D, 0xD8, 0x00, 0xDE];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "\u{1f600}");
+    }
+
+    #[test]
+    fn decode_bytes_utf16be_surrogate_pair_decodes_supplementary_character() {
+        let data = [0xFE, 0xFF, 0xD8, 0x3D, 0xDE, 0x00];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "\u{1f600}");
+    }
+
+    #[test]
+    fn decode_bytes_utf16le_unpaired_high_surrogate_is_replaced() {
+        let data = [0xFF, 0xFE, 0x00, 0xD8];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "\u{fffd}");
+    }
+
+    #[test]
+    fn decode_bytes_utf16be_unpaired_high_surrogate_is_replaced() {
+        let data = [0xFE, 0xFF, 0xD8, 0x00];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "\u{fffd}");
+    }
+
+    #[test]
+    fn decode_bytes_utf16le_unpaired_low_surrogate_is_replaced() {
+        let data = [0xFF, 0xFE, 0x00, 0xDC];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "\u{fffd}");
+    }
+
+    #[test]
+    fn decode_bytes_utf16be_unpaired_low_surrogate_is_replaced() {
+        let data = [0xFE, 0xFF, 0xDC, 0x00];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "\u{fffd}");
+    }
+
+    #[test]
+    fn decode_bytes_bomless_utf16le_nul_pattern_decodes_complete_units() {
+        let data = [0x41, 0x00, 0xAC, 0x20];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "A\u{20ac}");
+    }
+
+    #[test]
+    fn decode_bytes_bomless_utf16be_nul_pattern_decodes_complete_units() {
+        let data = [0x00, 0x41, 0x20, 0xAC];
+
+        let out = decode_bytes(&data);
+
+        assert_eq!(out, "A\u{20ac}");
     }
 }
