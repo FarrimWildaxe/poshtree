@@ -360,6 +360,13 @@ pub enum NodeKind {
         target: Box<Node>,
         /// The member name.
         member: String,
+        /// Original-input UTF-8 byte span of the directly consumed `Generic`
+        /// or `Keyword` name token, excluding the operator and trivia.
+        /// `None` for a variable name or a missing/unrecognized direct literal
+        /// (including quoted/computed forms). Broad generic tokens retain a
+        /// span even when unsuitable for rename; this does not validate the
+        /// whole expression. Retained during recovery, including unclosed calls.
+        member_span: Option<Span>,
         /// True for `::`, false for `.`.
         is_static: bool,
     },
@@ -369,6 +376,10 @@ pub enum NodeKind {
         target: Box<Node>,
         /// The method name.
         member: String,
+        /// Original-input UTF-8 byte span of the directly consumed `Generic`
+        /// or `Keyword` name token; same contract as
+        /// [`MemberAccess::member_span`](NodeKind::MemberAccess::member_span).
+        member_span: Option<Span>,
         /// True for `::`, false for `.`.
         is_static: bool,
         /// The call arguments.

@@ -15,6 +15,18 @@ use crate::v2::span::Span;
 /// the returned spans index the file directly. The final token is always
 /// [`Eof`](super::tokens::CsTokenKind::Eof).
 pub fn cs_lex(code: &str, base: usize) -> Vec<CsToken> {
+    lex(code, base, None)
+}
+
+/// Returns the ordinary token stream and the first token or trivia span that
+/// checked parsing can refuse independently of parser coverage.
+pub(super) fn lex_checked(code: &str, base: usize) -> (Vec<CsToken>, Option<Span>) {
+    let mut unsupported = None;
+    let tokens = lex(code, base, Some(&mut unsupported));
+    (tokens, unsupported)
+}
+
+fn lex(code: &str, base: usize, mut unsupported: Option<&mut Option<Span>>) -> Vec<CsToken> {
     let b = code.as_bytes();
     let n = b.len();
     let mut out = Vec::new();
@@ -37,16 +49,39 @@ pub fn cs_lex(code: &str, base: usize) -> Vec<CsToken> {
         }
         // Comments.
         if c == b'/' && i + 1 < n && b[i + 1] == b'/' {
+            let start = i;
             i += 2;
+            let mut ambiguous_end = false;
             while i < n && b[i] != b'\n' {
+                if unsupported.is_some() {
+                    ambiguous_end |= match &b[i..] {
+                        // These can end a C# line before the lexer stops at LF.
+                        [b'\r', next, ..] => *next != b'\n',
+                        [0xc2, 0x85, ..] | [0xe2, 0x80, 0xa8 | 0xa9, ..] => true,
+                        _ => false,
+                    };
+                }
                 i += 1;
+            }
+            if let Some(first) = unsupported.as_deref_mut() {
+                if ambiguous_end || i == n || b.get(start + 2) == Some(&b'/') {
+                    first.get_or_insert(Span::new(base + start, base + i));
+                }
             }
             continue;
         }
         if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            let start = i;
             i += 2;
             while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
                 i += 1;
+            }
+            if let Some(first) = unsupported.as_deref_mut() {
+                // In `/**/` the first star belongs to the closer, not a
+                // documentation opener.
+                if i + 1 >= n || (i != start + 2 && b.get(start + 2) == Some(&b'*')) {
+                    first.get_or_insert(Span::new(base + start, base + (i + 2).min(n)));
+                }
             }
             i = (i + 2).min(n);
             continue;
@@ -69,6 +104,17 @@ pub fn cs_lex(code: &str, base: usize) -> Vec<CsToken> {
             }
             while i < n && is_ident_continue(b[i]) {
                 i += 1;
+            }
+            if let Some(first) = unsupported.as_deref_mut() {
+                // Legacy identifiers can absorb non-ASCII whitespace, control
+                // characters, or a BOM. Detect that even if the parser recovers.
+                if first.is_none()
+                    && code[start..i]
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control() || c == '\u{feff}')
+                {
+                    *first = Some(Span::new(base + start, base + i));
+                }
             }
             push(&mut out, K::Ident, start, i);
             continue;
@@ -291,6 +337,27 @@ mod tests {
             .map(|t| t.text.as_str())
             .collect();
         assert_eq!(idents, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn ordinary_lex_still_discards_an_unterminated_block_comment() {
+        let code = "class C{int x;}/*";
+
+        let tokens = kinds(code);
+
+        assert_eq!(
+            tokens,
+            [
+                K::Ident,
+                K::Ident,
+                K::LBrace,
+                K::Ident,
+                K::Ident,
+                K::Semicolon,
+                K::RBrace,
+                K::Eof
+            ]
+        );
     }
 
     #[test]

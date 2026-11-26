@@ -5,18 +5,19 @@
 //! The `v1` pipeline is built for analysis: its lexer emits
 //! `Newline` and `Comment` tokens but drops plain whitespace, and
 //! its `unparse` regenerates spacing from scratch. That is the
-//! right trade for linting and metrics and the wrong one for the two tools
-//! planned next:
+//! right trade for linting and metrics, but formatting and targeted edits
+//! need the original layout:
 //!
 //! * a **formatter** must read the author's comments and line structure to
-//!   place them in the output, and must be able to prove "I only changed
-//!   whitespace";
+//!   place them in the output, and must check the structure of its result;
 //! * a **codemod** (e.g. `Get-WmiObject` to `Get-CimInstance`) must rewrite
 //!   one command and leave every other byte alone, or the diff is unusable.
 //!
 //! Both need the same foundation: tokens that own every byte of the input.
-//! Per the crate's versioning policy this is a breaking change to the token
-//! shape, so it ships as a sibling `v2` module; `v1` stays untouched.
+//! This different token shape ships as a sibling `v2` module so the `v1`
+//! design remains available. Sibling namespaces do not rule out justified
+//! crate-level breaking releases: during `0.x` development, these use a
+//! minor-version bump with migration guidance.
 //!
 //! # The invariant
 //!
@@ -31,31 +32,51 @@
 //!
 //! Every byte lands in exactly one token's `leading` trivia, `value`, or
 //! `trailing` trivia, in source order. [`reconstruct`] is the lossless
-//! unparse; the formatter and codemod tools never need the v1 unparser.
+//! unparse. This exact reconstruction of retained tokens is distinct from
+//! formatter acceptance, which checks a rewritten result rather than
+//! reproducing the original bytes.
 //!
 //! # From tokens to a tree
 //!
-//! Tokens alone carry the codemod use case (find a token, patch its span).
-//! For anything that reasons about structure, `tree::parse_with_tokens`
-//! (available when the `v1` feature is also enabled) pairs the v1 AST with
-//! these tokens: every node gets a `TokenRange` into the token vector, so
-//! `node.unparse_lossless()` returns that node's exact source, trivia and
-//! all. It reuses the v1 parser rather than forking the grammar; see the
-//! `tree` module for how ranges are recovered from node offsets. The walks
-//! come in untyped (`TreeNode::walk`, `walk_with_ancestors`) and typed
-//! (`Tree::walk_zipped`) forms; the zipped walk hands a visitor each typed
-//! v1 node, its range-bearing mirror, and the ancestor path, which is what
-//! a refactoring tool wants.
+//! Tokens alone support targeted edits (find a token, patch its span).
+//! [`parse`] and [`parse_tokens`] provide the native v2 syntax tree:
+//! each [`Node`] carries a byte [`Span`] and a [`TokenRange`] into the
+//! returned token vector. This parser works with `v2` alone.
+//!
+//! **The optional v1 bridge is deprecated in 0.5 documentation only.**
+//! Both `poshtree::v2::tree::parse_with_tokens` and its `poshtree::v2`
+//! re-export, along with `Tree` and `TreeNode`, remain repair-only throughout
+//! 0.5 and require `v1` in addition to `v2`. The v1 bridge and its `v2`
+//! re-exports will not be removed before 0.6.0.
+//!
+//! The bridge pairs the v1 AST with v2 tokens by recovering ranges from
+//! node offsets. Its node footprints include attached trivia;
+//! interpolation children inside a string token have empty ranges because
+//! the enclosing token retains their bytes. The bridge keeps v1's
+//! BOM-stripped node positions distinct from original-input token spans.
+//! It offers untyped walks (`TreeNode::walk`, `walk_with_ancestors`) and a
+//! zipped walk (`Tree::walk_zipped`) pairing typed v1 nodes with their
+//! range-bearing mirrors and ancestor paths. For native traversal use
+//! [`parse`] and [`Node::walk_with_ancestors`]; these do not reproduce the
+//! zipped v1 nodes, scalar summaries, or trivia-inclusive bridge footprints.
+//!
+//! For diagnostic text from a supported native AST, including an edited tree,
+//! use [`write_diagnostic_script`]. It is not the legacy error-tolerant
+//! source dump. Use [`reconstruct`] for exact token replay, [`format_source`]
+//! for checked source formatting, or [`apply_edits`] for targeted changes
+//! against the original bytes.
 //!
 //! # Formatting
 //!
 //! [`formatter::format_source`] is a width-aware formatter built on these
 //! tokens and verified with the native parser, so it works under `v2`
 //! alone. It normalizes indentation, spacing, blank lines, and over-long
-//! lines while preserving every token byte-for-byte, and it checks its own
-//! output by re-lexing and re-parsing: the result either round-trips to
-//! the identical program or the call returns an error instead of damaged
-//! source. See the `formatter` module docs for the exact rules.
+//! lines, then re-lexes and re-parses its output with v2. Acceptance requires
+//! clean output, identical significant token kinds and text, and recursively
+//! matching node labels and child shape. These checks are not a proof of
+//! semantic equivalence or full PowerShell correctness. A failed check
+//! returns [`FormatError::Unsafe`] without the candidate output; malformed
+//! input returns [`FormatError::Syntax`]. See the `formatter` module docs.
 //!
 //! # A native parser
 //!
@@ -63,7 +84,8 @@
 //! needs the `v1` feature. `parser::parse` is the standalone path: a native
 //! recursive-descent parser that consumes v2 tokens and builds an `ast::Node`
 //! tree directly, with each node carrying both a byte `Span` and a
-//! `TokenRange`. It depends on no `v1` code, so it builds under `v2` alone.
+//! `TokenRange`. This native parser already exists and depends on no `v1`
+//! code, so it builds under `v2` alone.
 //! Because v2 keeps newlines as trivia, statement boundaries come from
 //! `Token::starts_line` and `;`.
 //!
@@ -76,10 +98,10 @@
 //! broad corpus, including double-quoted string interpolation parts (`$var`,
 //! `${name}`, `$(...)`) and `Add-Type` C# extraction (`[DllImport]` P/Invoke
 //! parsing, with constant propagation of a string assigned to a variable). A
-//! companion test checks the extracted C# metadata against v1's field by
-//! field. The remaining differences are at the lexer, not the parser: the v1
-//! and v2 lexers tokenize a few things differently (for example a dotted run
-//! such as `a.b.c`).
+//! companion test compares selected metadata fields, not complete extraction
+//! parity. Without `csharp`, native `Add-Type` import extraction uses a fallback
+//! scanner. Enabling `csharp` uses bounded parsed extraction with richer type
+//! spellings; neither is a drop-in replacement for the v1 extractor.
 //!
 //! ```
 //! use poshtree::v2::{parse, NodeKind};
@@ -125,8 +147,7 @@
 //! match v1. The lexer, spans, trivia, and edits therefore compile without
 //! v1 (build with `default-features = false, features = ["v2"]`); the one
 //! v2 component that does use v1 is `tree`, which by design runs the v1
-//! parser and is only compiled when both features are on (see its docs for
-//! the removal path).
+//! parser and is only compiled when both features are on.
 //!
 //! # Where v2 lexing deliberately differs from v1
 //!
@@ -160,7 +181,11 @@
 //! compared `tok.pos` arithmetic to detect glued tokens compares
 //! `a.span.end == b.span.start` instead. Decoded payloads (`text`,
 //! `scope`, `splat`) are derived from `value` on demand.
+//! Comment trivia can locate native comment bytes for caller-supplied masking;
+//! it does not reproduce v1's comment recognition or byte-preserving mask.
 
+#[cfg(test)]
+mod analysis;
 pub mod ast;
 #[cfg(feature = "csharp")]
 pub mod csharp;
@@ -168,6 +193,9 @@ pub mod edit;
 pub mod formatter;
 pub mod lexer;
 pub mod parser;
+mod render;
+#[cfg(test)]
+mod resource;
 pub mod span;
 pub mod tokens;
 #[cfg(feature = "v1")]
@@ -180,6 +208,7 @@ pub use edit::{apply_edits, EditError, TextEdit};
 pub use formatter::{format_source, format_source_with, FormatError, FormatOptions};
 pub use lexer::{lex, LexOutput};
 pub use parser::{parse, parse_tokens, ParseError, ParseOutput};
+pub use render::{write_diagnostic_script, DiagnosticRenderError};
 pub use span::{LineCol, LineIndex, Span, TokenRange};
 pub use tokens::{LexError, Token, TokenKind};
 #[cfg(feature = "v1")]

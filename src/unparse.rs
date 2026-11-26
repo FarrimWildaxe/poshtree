@@ -1,5 +1,10 @@
 //! Reconstruct ("unparse") an [`AstNode`] tree back into PowerShell source.
 //!
+//! **Deprecated in 0.5 documentation only.** This module and its crate-root
+//! re-exports remain available behind the opt-in `v1` feature and are
+//! repair-only throughout 0.5. The legacy unparse APIs will not be removed
+//! before 0.6.0.
+//!
 //! This is mainly a debugging tool. Parse a script, unparse the result, and
 //! diff it against the original to see how the parser read the input. Where the
 //! reconstruction differs, the parser dropped or reshaped something at that
@@ -7,18 +12,22 @@
 //!
 //! ```no_run
 //! use std::fs::File;
+//! # fn main() -> std::io::Result<()> {
 //! # fn read() -> String { String::new() }
 //! let source = read();
-//! let mut f = File::create("dump.ps1").unwrap();
-//! poshtree::unparse::dump_ast_to_ps1(&source, &mut f);
+//! let mut f = File::create("dump.ps1")?;
+//! poshtree::unparse::dump_ast_to_ps1(&source, &mut f)?;
+//! # Ok(())
+//! # }
 //! ```
 //!
-//! The output is meant to re-parse cleanly rather than match the original byte
-//! for byte. The tree does not keep exact whitespace, comments, or every
-//! original spelling, so leaf tokens are emitted from their captured `raw` text
-//! when it is available and re-synthesised otherwise.
+//! The output is diagnostic, not lossless: it is not guaranteed to be
+//! semantically equivalent to the input or executable PowerShell. The tree
+//! does not keep exact whitespace, comments, or every original spelling, so
+//! leaf tokens are emitted from their captured `raw` text when it is available
+//! and re-synthesised otherwise. This module requires the `v1` feature.
 
-use std::io::Write;
+use std::io::{self, Write};
 
 use crate::v1::ast::{AstNode, Attribute, Command, ScriptBlock, StringLiteral};
 use crate::v1::parser::parse;
@@ -27,14 +36,44 @@ const INDENT: &str = "    ";
 
 /// Parse `source` and write the reconstructed PowerShell to `writer`.
 ///
-/// Mirrors the host project's `dump_ast` but emits runnable source
-/// rather than an indented node tree. Parse errors are tolerated (the partial
-/// tree, with any `ErrorNode`s rendered from their raw text, is still emitted).
-pub fn dump_ast_to_ps1(source: &str, writer: &mut impl Write) {
-    let _ = write!(writer, "{}", unparse_source(source));
+/// Emits diagnostic source rather than an indented node tree. The output is
+/// not lossless; semantic equivalence and executability are not guaranteed.
+/// Parse errors are tolerated (the partial tree, with any `ErrorNode`s
+/// rendered from their raw text, is still emitted).
+///
+/// **Deprecated in 0.5 documentation only**, including the
+/// `poshtree::dump_ast_to_ps1` alias. For diagnostic text from a supported
+/// native AST, including an edited tree, use
+/// `poshtree::v2::write_diagnostic_script` with the `v2` feature. That writer
+/// takes a tree, refuses unsupported nodes, and does not replace this
+/// error-tolerant source dump. Starting from source, parse and handle
+/// diagnostics separately before deciding whether to render.
+///
+/// # Errors
+///
+/// Returns the writer's I/O error unchanged. An error may leave partial output
+/// in `writer`; no rollback or flush is performed.
+pub fn dump_ast_to_ps1(source: &str, writer: &mut impl Write) -> io::Result<()> {
+    write!(writer, "{}", unparse_source(source))
 }
 
 /// Parse `source` and return the reconstructed PowerShell as a string.
+///
+/// Available enum base information is emitted without inferring a default base
+/// when none is recorded. The output is diagnostic, not lossless: it is not
+/// guaranteed to be semantically equivalent to the input or executable PowerShell.
+///
+/// # Examples
+///
+/// ```
+/// use poshtree::unparse::unparse_source;
+///
+/// let source = "enum E : byte { A=1 }";
+///
+/// let output = unparse_source(source);
+///
+/// assert_eq!(output, "enum E : byte {\n    A = 1\n}\n");
+/// ```
 pub fn unparse_source(source: &str) -> String {
     let (tree, _) = parse(source);
     unparse(&tree)
@@ -186,7 +225,12 @@ fn emit_stmt(node: &AstNode, depth: usize, out: &mut String) {
             }
         }
         AstNode::EnumDefinition(n) => {
-            out.push_str(&format!("{pad}enum {} {{\n", n.name));
+            let base = if n.base.is_empty() {
+                String::new()
+            } else {
+                format!(" : {}", n.base)
+            };
+            out.push_str(&format!("{pad}enum {}{} {{\n", n.name, base));
             let inner = INDENT.repeat(depth + 1);
             for m in &n.members {
                 out.push_str(&format!("{inner}{}\n", emit_inline(m)));
@@ -406,7 +450,14 @@ fn emit_inline(node: &AstNode) -> String {
             };
             format!("class {}{} {{ … }}", n.name, bases)
         }
-        AstNode::EnumDefinition(n) => format!("enum {} {{ … }}", n.name),
+        AstNode::EnumDefinition(n) => {
+            let base = if n.base.is_empty() {
+                String::new()
+            } else {
+                format!(" : {}", n.base)
+            };
+            format!("enum {}{} {{ … }}", n.name, base)
+        }
         AstNode::ClassMember(n) => {
             let t = if n.type_name.is_empty() {
                 String::new()
@@ -523,6 +574,38 @@ mod tests {
     use super::*;
     use crate::v1::ast::AstNode;
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct WriteFailure;
+
+    impl std::fmt::Display for WriteFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("synthetic write failure")
+        }
+    }
+
+    impl std::error::Error for WriteFailure {}
+
+    #[derive(Default)]
+    struct FailingWriter {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.bytes.len() >= self.limit {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, WriteFailure));
+            }
+            let count = buf.len().min(self.limit - self.bytes.len());
+            self.bytes.extend_from_slice(&buf[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// True when `src` re-parses with no errors and no `ErrorNode`s.
     fn reparses_clean(src: &str) -> bool {
         let (tree, errors) = parse(src);
@@ -596,10 +679,105 @@ mod tests {
     }
 
     #[test]
+    fn unparse_source_preserves_typed_enum_base() {
+        let source = "enum E : byte { A=1 }";
+
+        let output = unparse_source(source);
+
+        assert_eq!(output, "enum E : byte {\n    A = 1\n}\n");
+    }
+
+    #[test]
+    fn unparse_source_preserves_untyped_enum_header() {
+        let source = "enum E { A=1 }";
+
+        let output = unparse_source(source);
+
+        assert_eq!(output, "enum E {\n    A = 1\n}\n");
+    }
+
+    #[test]
+    fn unparse_source_preserves_typed_inline_enum_base() {
+        let source = "$x = { enum E : byte { A=1 } }";
+
+        let output = unparse_source(source);
+
+        assert_eq!(output, "$x = { enum E : byte { … } }\n");
+    }
+
+    #[test]
+    fn unparse_source_preserves_untyped_inline_enum_header() {
+        let source = "$x = { enum E { A=1 } }";
+
+        let output = unparse_source(source);
+
+        assert_eq!(output, "$x = { enum E { … } }\n");
+    }
+
+    #[test]
     fn dump_writes_to_writer() {
         let mut buf: Vec<u8> = Vec::new();
-        dump_ast_to_ps1("$x = 1", &mut buf);
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("$x = 1"), "unexpected dump: {s:?}");
+
+        let result = dump_ast_to_ps1("$x = 1", &mut buf);
+
+        assert!(matches!(result, Ok(())), "unexpected result: {result:?}");
+        assert_eq!(buf, b"$x = 1\n");
+    }
+
+    #[test]
+    fn dump_writes_no_bytes_for_empty_input() {
+        let mut buf: Vec<u8> = Vec::new();
+
+        let result = dump_ast_to_ps1("", &mut buf);
+
+        assert!(matches!(result, Ok(())), "unexpected result: {result:?}");
+        assert_eq!(buf, b"");
+    }
+
+    #[test]
+    fn dump_writes_unicode_string_as_utf8() {
+        let mut buf: Vec<u8> = Vec::new();
+
+        let result = dump_ast_to_ps1("$x = 'héllo 世界 🦀'", &mut buf);
+
+        assert!(matches!(result, Ok(())), "unexpected result: {result:?}");
+        assert_eq!(buf, "$x = 'héllo 世界 🦀'\n".as_bytes());
+    }
+
+    #[test]
+    fn dump_returns_writer_error_when_first_write_fails() {
+        let mut writer = FailingWriter::default();
+
+        let result = dump_ast_to_ps1("$x = 1", &mut writer);
+
+        let error = result.expect_err("the writer rejects every write");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<WriteFailure>()),
+            Some(&WriteFailure)
+        );
+        assert_eq!(writer.bytes, b"");
+    }
+
+    #[test]
+    fn dump_returns_writer_error_after_partial_output() {
+        let mut writer = FailingWriter {
+            limit: 3,
+            ..Default::default()
+        };
+
+        let result = dump_ast_to_ps1("$x = 1", &mut writer);
+
+        let error = result.expect_err("the writer rejects writes after three bytes");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<WriteFailure>()),
+            Some(&WriteFailure)
+        );
+        assert_eq!(writer.bytes, b"$x ");
     }
 }

@@ -3,12 +3,14 @@
 //! One uniform node type, [`CsNode`], carries a kind, a span, and children.
 //! The structure is deliberately shallow: it models the declarations, scopes,
 //! and identifier references that renaming needs, and treats expression detail
-//! generically. Anything outside the dialect parses into an
-//! [`Error`](CsNodeKind::Error) node rather than failing.
+//! generically. Unmatched input recovers into an [`Error`](CsNodeKind::Error)
+//! node rather than failing. The lexer discards whitespace and comments, so
+//! this AST is not lossless; span edits against the original source preserve
+//! bytes outside edited ranges.
 //!
-//! Every renameable identifier (a declaration name or a reference) is a
-//! [`CsName`] with its own precise span. The PowerShell AST has no such span
-//! for member and type names, which is what makes correct C# renaming possible.
+//! Captured declaration names and identifier references are [`CsName`] values
+//! with their own byte spans. Those spans locate edits; they do not establish
+//! full C# semantic identity or guarantee complete rename coverage.
 
 use crate::v2::span::Span;
 
@@ -49,9 +51,10 @@ pub enum CsNodeKind {
         kind: CsTypeKind,
         /// The declared type name.
         name: CsName,
-        /// Base type and interface names from the `: A, IFoo` list, first
-        /// identifier of each entry (generics and namespaces dropped). Empty
-        /// when the type has no base list.
+        /// Base type and interface names from the `: A, IFoo` list. Stores the
+        /// final identifier of a `.`/`::`-qualified entry (`N.Base<T>` keeps
+        /// `Base`), excluding qualifiers and generic argument names. Empty
+        /// when the type has no base list; not a qualified type identity.
         bases: Vec<CsName>,
     },
     /// A method declaration. A scope; parameters and body are children.

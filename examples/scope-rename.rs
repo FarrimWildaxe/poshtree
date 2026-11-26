@@ -6,6 +6,9 @@
 //! function's `$Path` stay distinct even though `$LogDir` is the value passed to
 //! `-Path`.
 //!
+//! This example models script/function variable scopes, not full PowerShell
+//! binding semantics: named arguments such as `-Path` and `-Days` stay unchanged.
+//!
 //! Two pieces that earlier versions hand-rolled are gone:
 //!
 //! * The function-definition rename used to scan the token stream for the
@@ -137,6 +140,18 @@ fn is_user_variable(raw: &str) -> bool {
     !is_automatic_variable(raw) && !is_preference_variable(raw) && !variable_name(raw).is_empty()
 }
 
+/// Parameter declarations own their name token; their full span also includes
+/// attributes and defaults, which must not be replaced along with the name.
+fn variable_site(node: &Node) -> Option<(&str, Span)> {
+    match &node.kind {
+        NodeKind::Variable(raw) => Some((raw, node.span)),
+        NodeKind::Parameter {
+            name, name_span, ..
+        } => Some((name, *name_span)),
+        _ => None,
+    }
+}
+
 /// Assigns a new name to each distinct `(scope, variable)`, in source order.
 fn register_variables(
     script: &Node,
@@ -145,14 +160,14 @@ fn register_variables(
     order: &mut Vec<(ScopeId, String)>,
 ) {
     script.walk(&mut |node| {
-        let NodeKind::Variable(raw) = &node.kind else {
+        let Some((raw, span)) = variable_site(node) else {
             return;
         };
         if !is_user_variable(raw) {
             return;
         }
         let bare = variable_name(raw);
-        let scope = scope_of(node.span, scopes);
+        let scope = scope_of(span, scopes);
         names
             .entry((scope, bare.to_ascii_lowercase()))
             .or_insert_with(|| {
@@ -163,9 +178,10 @@ fn register_variables(
     });
 }
 
-/// One edit per `Variable` node. The 0.2.3 interpolation-span fix means every
-/// reference span is trustworthy, including those inside `"$( ... )"`, so this
-/// edits spans directly with no token rewriting or span guard.
+/// One edit per variable reference or parameter name. The 0.2.3
+/// interpolation-span fix means every reference span is trustworthy, including
+/// those inside `"$( ... )"`, so this edits spans directly with no token rewriting
+/// or span guard.
 fn variable_edits(
     script: &Node,
     scopes: &[Scope],
@@ -173,16 +189,16 @@ fn variable_edits(
 ) -> Vec<TextEdit> {
     let mut edits = Vec::new();
     script.walk(&mut |node| {
-        let NodeKind::Variable(raw) = &node.kind else {
+        let Some((raw, span)) = variable_site(node) else {
             return;
         };
         if !is_user_variable(raw) {
             return;
         }
         let bare = variable_name(raw);
-        let scope = scope_of(node.span, scopes);
+        let scope = scope_of(span, scopes);
         if let Some(new) = names.get(&(scope, bare.to_ascii_lowercase())) {
-            edits.push(rewrite_variable(raw, node.span, new));
+            edits.push(rewrite_variable(raw, span, new));
         }
     });
     edits
@@ -287,40 +303,150 @@ mod tests {
 
     #[test]
     fn rename_is_scope_aware_and_skips_builtins() {
+        let expected = r#"param(
+    [string]$name_var0 = 'C:\Logs',
+    [int]$name_var1 = 30
+)
+
+function name_func0 {
+    param([string]$name_var2, [int]$name_var3)
+
+    if (-not (Test-Path -Path $name_var2)) {
+        Write-Host "Log directory $name_var2 does not exist; creating it."
+        New-Item -Path $name_var2 -ItemType Directory | Out-Null
+        return
+    }
+
+    $name_var4 = (Get-Date).AddDays(-$name_var3)
+    $name_var5 = Get-ChildItem -Path $name_var2 -Filter '*.log' |
+        Where-Object { $_.LastWriteTime -lt $name_var4 }
+
+    foreach ($name_var6 in $name_var5) {
+        Write-Host "Removing $($name_var6.Name)"
+        Remove-Item -Path $name_var6.FullName -Force
+    }
+
+    Write-Host "Removed $($name_var5.Count) file(s)."
+}
+
+name_func0 -Path $name_var0 -Days $name_var1
+"#;
+        let expected_report = "variables (by scope):
+  [script]
+    $LogDir -> $name_var0
+    $KeepDays -> $name_var1
+  [function Remove-OldLogs]
+    $Path -> $name_var2
+    $Days -> $name_var3
+    $cutoff -> $name_var4
+    $old -> $name_var5
+    $file -> $name_var6
+functions:
+    Remove-OldLogs -> name_func0
+";
+
         let r = rename(SCRIPT);
-        let report = mapping_report(&r);
 
-        // Same edit count as the hand-rolled version this replaces.
+        // Four parameter declarations + fifteen variable references (including
+        // assignment/foreach targets) + the function definition and call.
         assert_eq!(r.edit_count, 21);
+        assert_eq!(mapping_report(&r), expected_report);
+        assert_eq!(r.renamed, expected);
+    }
 
-        // Script-scope variables are numbered before the function's.
-        assert!(report.contains("$LogDir -> $name_var0"));
-        assert!(report.contains("$KeepDays -> $name_var1"));
+    #[test]
+    fn rename_unused_script_parameter_registers_and_edits_declaration() {
+        let src = "param($Unused)\n";
 
-        // The function's own scope: distinct numbers, in source order.
-        assert!(report.contains("$Path -> $name_var2"));
-        assert!(report.contains("$Days -> $name_var3"));
-        assert!(report.contains("$cutoff -> $name_var4"));
-        assert!(report.contains("$old -> $name_var5"));
-        assert!(report.contains("$file -> $name_var6"));
+        let r = rename(src);
 
-        // The function definition and its call site share the new name.
-        assert!(report.contains("Remove-OldLogs -> name_func0"));
+        assert_eq!(r.renamed, "param($name_var0)\n");
+        assert_eq!(r.edit_count, 1);
+        assert_eq!(
+            mapping_report(&r),
+            "variables (by scope):\n  [script]\n    $Unused -> $name_var0\nfunctions:\n"
+        );
+    }
 
-        // The automatic $_ is untouched; every user identifier is gone.
-        assert!(r.renamed.contains("$_"));
-        for original in [
-            "$LogDir",
-            "$KeepDays",
-            "$Path",
-            "$Days",
-            "$cutoff",
-            "$old",
-            "$file",
-            "Remove-OldLogs",
-        ] {
-            assert!(!r.renamed.contains(original), "{original} should be gone");
-        }
+    #[test]
+    fn rename_attributed_typed_parameters_preserves_syntax_and_numbers_before_default() {
+        let src = r#"param(
+    [Parameter(Mandatory=$true)][string]$Value = $Fallback,
+    [int]$Limit = 7
+)
+$Value; $Fallback; $Limit
+"#;
+        let expected = r#"param(
+    [Parameter(Mandatory=$true)][string]$name_var0 = $name_var1,
+    [int]$name_var2 = 7
+)
+$name_var0; $name_var1; $name_var2
+"#;
+
+        let r = rename(src);
+
+        assert_eq!(r.renamed, expected);
+        assert_eq!(r.edit_count, 6);
+        assert_eq!(
+            mapping_report(&r),
+            "variables (by scope):
+  [script]
+    $Value -> $name_var0
+    $Fallback -> $name_var1
+    $Limit -> $name_var2
+functions:
+"
+        );
+    }
+
+    #[test]
+    fn rename_same_parameter_spelling_in_script_and_function_keeps_scopes_distinct() {
+        let src = "param($Value)\n$Value\nfunction F { param($Value) $Value }\n$Value\nF\n";
+        let expected = "param($name_var0)\n$name_var0\nfunction name_func0 { param($name_var1) $name_var1 }\n$name_var0\nname_func0\n";
+
+        let r = rename(src);
+
+        assert_eq!(r.renamed, expected);
+        assert_eq!(r.edit_count, 7);
+        assert_eq!(
+            mapping_report(&r),
+            "variables (by scope):
+  [script]
+    $Value -> $name_var0
+  [function F]
+    $Value -> $name_var1
+functions:
+    F -> name_func0
+"
+        );
+    }
+
+    #[test]
+    fn rename_function_parameter_list_edits_declaration_and_reference() {
+        let src = "function F([int]$Value = 1) { $Value }\nF\n";
+
+        let r = rename(src);
+
+        assert_eq!(
+            r.renamed,
+            "function name_func0([int]$name_var0 = 1) { $name_var0 }\nname_func0\n"
+        );
+        assert_eq!(r.edit_count, 4);
+    }
+
+    #[test]
+    fn rename_automatic_and_preference_parameters_leaves_declarations_and_references_unchanged() {
+        let src = "param($PSItem, $ErrorActionPreference, $Value)\n$PSItem; $ErrorActionPreference; $Value\n";
+        let expected = "param($PSItem, $ErrorActionPreference, $name_var0)\n$PSItem; $ErrorActionPreference; $name_var0\n";
+
+        let r = rename(src);
+
+        assert_eq!(r.renamed, expected);
+        assert_eq!(r.edit_count, 2);
+        assert_eq!(
+            mapping_report(&r),
+            "variables (by scope):\n  [script]\n    $Value -> $name_var0\nfunctions:\n"
+        );
     }
 
     #[test]

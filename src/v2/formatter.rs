@@ -5,8 +5,8 @@
 //! The formatter is token-driven and structure-checked. It does not build
 //! output from the AST; it rewrites the whitespace *between* tokens, using
 //! the bracket structure for indentation and a Wadler-style document IR for
-//! width-aware line breaking. Token text is never altered, which the safety
-//! harness then verifies.
+//! width-aware line breaking. The native v2 lexer and parser check the result;
+//! neither formatting nor verification requires `v1`.
 //!
 //! What it normalizes: indentation (from nesting depth), runs of blanks to a
 //! single space, blank lines to at most one, line endings to `\n`, backtick
@@ -24,12 +24,17 @@
 //! [`format_source`] refuses input that does not lex and parse cleanly
 //! ([`FormatError::Syntax`]), and before returning it re-lexes and re-parses
 //! its own output and demands two equivalences: the significant token
-//! sequence (kind and text) is unchanged, and the parse-tree fingerprint
-//! (node labels and shape) is unchanged. The tree check earns its place
+//! sequence (kind and text, excluding EOF) is unchanged, and the parse-tree
+//! fingerprint (recursive node labels and child shape) is unchanged. Output
+//! must also lex and parse without errors. The tree check earns its place
 //! because reformatting moves newlines, and the parser reads newlines to
-//! find statement boundaries. On any mismatch the caller gets
-//! [`FormatError::Unsafe`] instead of damaged source. The test suite
-//! also pins idempotence: formatting twice equals formatting once.
+//! find statement boundaries. On any failed check the caller gets
+//! [`FormatError::Unsafe`] without the candidate output. These checks do not
+//! compare all AST scalar fields or prove semantic equivalence, and do not
+//! guarantee acceptance of every real-world script. Exact byte reconstruction
+//! through [`super::reconstruct`] is a separate property of retained tokens,
+//! not a claim about formatted output. The test suite also checks idempotence:
+//! formatting twice equals formatting once for its accepted cases.
 
 use super::ast::Node;
 use super::tokens::{Token, TokenKind};
@@ -66,18 +71,17 @@ impl Default for FormatOptions {
 }
 
 /// Why the formatter declined to produce output. It never returns
-/// best-effort text: the result is either verified or absent.
+/// best-effort text: output is returned only after the module's acceptance
+/// checks pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatError {
     /// The input has lexer or parser errors; formatting malformed source
     /// risks changing what the author meant, so it is refused.
     Syntax { errors: Vec<String> },
-    /// The formatter could not prove its output equivalent to the input,
-    /// so the output was discarded. This is either a formatter bug or an
-    /// input where v1 and v2 disagree about lexical structure (adversarial
-    /// constructs such as quotes hidden inside what the other version
-    /// considers a comment). Real-world scripts do not trip this; in either
-    /// case no damaged output is ever returned.
+    /// The candidate output failed a v2 acceptance check and was discarded:
+    /// it did not lex or parse cleanly, changed the significant token kinds
+    /// or text, or changed recursive node labels or child shape. This is not
+    /// a v1/v2 comparison or a proof about program semantics.
     Unsafe { reason: String },
 }
 
@@ -97,12 +101,34 @@ impl fmt::Display for FormatError {
 impl std::error::Error for FormatError {}
 
 /// Formats PowerShell source with [`FormatOptions::default`].
+///
+/// ```
+/// use poshtree::v2::format_source;
+///
+/// let source = "ls   -la\n";
+///
+/// let formatted = format_source(source);
+///
+/// assert_eq!(formatted, Ok("ls -la\n".to_string()));
+/// ```
+///
+/// Malformed input is refused rather than formatted best-effort:
+///
+/// ```
+/// use poshtree::v2::{format_source, FormatError};
+///
+/// let source = "'unterminated\n";
+///
+/// let result = format_source(source);
+///
+/// assert!(matches!(result, Err(FormatError::Syntax { .. })), "{result:?}");
+/// ```
 pub fn format_source(src: &str) -> Result<String, FormatError> {
     format_source_with(src, &FormatOptions::default())
 }
 
 /// Formats PowerShell source with explicit options. See the module docs for
-/// what is normalized, what is preserved, and the safety guarantees.
+/// what is normalized, what is preserved, and the acceptance checks.
 pub fn format_source_with(src: &str, options: &FormatOptions) -> Result<String, FormatError> {
     let lexed = super::lex(src);
     if !lexed.errors.is_empty() {
@@ -133,10 +159,10 @@ pub fn format_source_with(src: &str, options: &FormatOptions) -> Result<String, 
     Ok(out)
 }
 
-/// The harness: the output must lex and parse to the same program. The token
-/// stream is compared exactly, and the parse-tree shape is compared because
-/// reformatting moves newlines, which is what the native parser reads to find
-/// statement boundaries.
+/// The harness: output must lex and parse cleanly with v2. Significant token
+/// kinds and text are compared exactly, and tree labels and shape are compared
+/// because reformatting moves newlines, which is what the native parser reads
+/// to find statement boundaries.
 fn verify_equivalent(
     input_tokens: &[Token],
     input_root: &Node,
@@ -336,9 +362,8 @@ fn fits<'a>(remaining: usize, docs: &'a [Doc], stack: &mut Vec<&'a Doc>) -> bool
 
 /// One piece of the gap between two significant tokens, in source order.
 /// `glued_left`/`glued_right` mean byte-adjacency to the neighboring
-/// non-whitespace content: v1's raw argument scanner runs barewords through
-/// glued `#` and glued backtick continuations, so those must be re-emitted
-/// exactly as written or the v1 parse changes.
+/// non-whitespace content. Glued comments and backtick continuations are
+/// byte-sensitive, so the emitter retains their adjacency and text.
 #[derive(Debug, Clone)]
 enum GapItem {
     /// One line break.
@@ -346,8 +371,8 @@ enum GapItem {
     /// A comment: text, is-block, glued_left, glued_right.
     Comment(String, bool, bool, bool),
     /// A backtick line continuation glued to non-space on both sides (the
-    /// inside of a v1 bareword). A spaced continuation is dropped, joining
-    /// the lines, which is safe; a glued one carries its exact text.
+    /// inside of a bareword). A spaced continuation is dropped, joining
+    /// the lines; the result still has to pass the acceptance checks.
     GluedContinuation(String),
 }
 
@@ -417,7 +442,7 @@ struct Emitter<'a> {
     gaps: Vec<Gap>,
     pos: usize,
     /// Whether bracket tokens balance. When they do not (PowerShell lets
-    /// brackets live inside bareword arguments and comments, so a v1-clean
+    /// brackets live inside bareword arguments and comments, so a parsed
     /// file can have unbalanced v2 bracket tokens), the emitter falls back
     /// to flat output: no bracket recursion, no reindentation, spacing and
     /// line handling only.
@@ -699,9 +724,8 @@ impl<'a> Emitter<'a> {
     }
 }
 
-/// Do the bracket tokens pair up? Mismatches mean the brackets are bareword
-/// or comment text from v1's point of view, and structural emission would
-/// misread the file.
+/// Do the bracket tokens pair up? On a mismatch, avoid treating their nesting
+/// as block structure; the flat fallback still has to pass verification.
 fn brackets_balanced(tokens: &[Token]) -> bool {
     let mut stack: Vec<TokenKind> = Vec::new();
     for tok in tokens {

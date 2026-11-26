@@ -1,6 +1,6 @@
 [package]
 name        = "poshtree"
-version     = "0.4.2"
+version     = "0.5.0"
 edition     = "2021"
 description = "PowerShell syntax tree: tokenizer, parser, AST, and unparser"
 license     = "MIT"
@@ -16,13 +16,14 @@ repository  = "https://github.com/FarrimWildaxe/poshtree"
 [workspace]
 
 [features]
-# v2 is the default front-end; v1 is opt-in.
+# v2 and csharp are enabled by default; v1 is opt-in.
 default = ["v2", "csharp"]
 # The lossless layer: trivia-bearing tokens, byte spans, text edits, a native
 # recursive-descent parser, and a formatter. Zero dependencies.
 v2 = []
 # Self-contained C# front-end over Add-Type blocks (lexer, parser, resolver,
-# C#-aware refactors). Opt-in, builds on v2, zero runtime dependencies.
+# bounded C#-aware refactors). Default-enabled but can be disabled; enables v2
+# and adds no external dependencies.
 csharp = ["v2"]
 # Legacy front-end: tokenizer, AST, parser, unparser. Off by default. Owns the
 # only dependency (`regex`, used by the v1 parser for Add-Type C# extraction;
@@ -34,8 +35,8 @@ v1 = ["dep:regex"]
 [dependencies]
 regex = { version = "1", optional = true }
 
-# Standalone-v2 demo: PascalCase PowerShell command names via lex + native
-# parse + span edits. Requires only the `v2` feature, so it builds with
+# Standalone-v2 demo: capitalize each hyphen-separated command-name segment
+# via lex + native parse + span edits. Requires only `v2`, so it builds with
 # `--no-default-features --features v2`.
 [[example]]
 name = "pascalize"
@@ -47,12 +48,14 @@ required-features = ["v2"]
 name = "pinvoke-report"
 required-features = ["csharp"]
 
-# Renames a C# type or member across the Add-Type block and its PowerShell call
-# sites in one pass. Needs the C# front-end.
+# Renames a C# type or member across an Add-Type block and recognized PowerShell
+# sites. Built-in demo or stdin rename; needs the C# front-end.
 [[example]]
 name = "rename-native"
 required-features = ["csharp"]
 
+# Built-in variable/function rename demo with a limited script/function-scope
+# model, not a general file/stdin CLI or full PowerShell binder. Needs only v2.
 [[example]]
 name = "scope-rename"
 path = "examples/scope-rename.rs"
