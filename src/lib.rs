@@ -17,38 +17,27 @@
 //! Supported references are bound per embedded unit; there is no assembly or
 //! external type resolution, full C# semantic analysis, or lossless C# AST
 //! unparser. Both features have no external dependencies. For PowerShell-only
-//! tooling, use `default-features = false, features = ["v2"]`.
+//! tooling, use `default-features = false, features = ["v2"]`. With all features
+//! disabled, `encoding`, `textutil`, `decode_bytes`, and `strip_bom` remain
+//! available.
 //!
-//! # Legacy v1 and bridge support in 0.5
+//! # Changes in 0.6.0
 //!
-//! `poshtree::v1`, the `poshtree::unparse` module, and the flat crate-root
-//! exports `tokenize`, `parse`, `parse_tokens`, `Token`, `AstNode`, `NodeInfo`,
-//! `ScriptBlock`, `unparse`, `unparse_source`, and `dump_ast_to_ps1` are
-//! deprecated in documentation only and remain repair-only throughout 0.5.
-//! All still require the opt-in `v1` feature, which owns the crate's only
-//! dependency, `regex`. Enabling `v2` does not change what those names refer to.
-//! Use `default-features = false, features = ["v1"]` for just the legacy
-//! front end. The same notice applies to `poshtree::v2::tree` and its `v2`
-//! re-exports (`parse_with_tokens`, `Tree`, and `TreeNode`), which still require
-//! both `v1` and `v2`.
+//! The `v1` feature, the legacy front end and unparser, their crate-root
+//! re-exports, and the `v2::tree` bridge and its re-exports have been removed
+//! without compatibility aliases. Use `v2::lex`, `v2::parse`, and
+//! `v2::Node::walk_with_ancestors` for native tokens, parsing, and traversal;
+//! tokenization, source coordinates, and child order can differ from 0.5's
+//! legacy APIs.
 //!
-//! For new code, use qualified `poshtree::v2` APIs. Choose
-//! `v2::write_diagnostic_script` for a supported native AST (including edits),
-//! `v2::reconstruct` for exact token replay, `v2::format_source` for checked
-//! formatting, or `v2::apply_edits` for explicit source-span edits. None
-//! reproduces the legacy source dump's parse-error tolerance or the bridge's
-//! zipped traversal of typed v1 nodes. The legacy v1 front end, unparse APIs,
-//! and bridge, including their re-exports, will not be removed before 0.6.0.
+//! Choose `v2::write_diagnostic_script` for bounded diagnostic text from a
+//! supported, possibly edited native AST, `v2::reconstruct` for exact
+//! retained-token replay, `v2::format_source` for checked formatting, or
+//! `v2::apply_edits` for explicit byte-span edits to the original source.
+//! These are distinct tasks, not interchangeable replacements for the
+//! removed APIs.
 //!
-//! # Migrating to 0.5.0
-//!
-//! With the opt-in `v1` feature, both `poshtree::dump_ast_to_ps1` and
-//! `poshtree::unparse::dump_ast_to_ps1` now return `std::io::Result<()>`
-//! instead of `()`. Use `?` in a function returning `std::io::Result<()>`, or
-//! handle errors explicitly. Writer errors are returned unchanged and may
-//! leave partial output; the function does not roll back or flush the writer.
-//! Its output remains diagnostic, not lossless or guaranteed semantically
-//! equivalent to the input or executable PowerShell.
+//! # Native API changes in 0.5.0
 //!
 //! Version 0.5.0 adds `v2::EditError::InvalidRange(Span)`.
 //! Exhaustive matches on `EditError` must handle this variant. `apply_edits`
@@ -155,28 +144,10 @@
 //! ```
 
 pub mod encoding;
-#[cfg(any(feature = "v1", feature = "v2"))]
+#[cfg(feature = "v2")]
 mod ops;
 pub mod textutil;
-#[cfg(feature = "v1")]
-pub mod unparse;
-#[cfg(feature = "v1")]
-pub mod v1;
 #[cfg(feature = "v2")]
 pub mod v2;
 
-// Flat re-exports: the most common items. These stay v1-only on purpose;
-// `v2::Token` would clash with `v1::tokens::Token`, so v2 items are always
-// path-qualified.
-
 pub use encoding::{decode_bytes, strip_bom};
-#[cfg(feature = "v1")]
-pub use unparse::{dump_ast_to_ps1, unparse, unparse_source};
-#[cfg(feature = "v1")]
-pub use v1::ast::{AstNode, NodeInfo, ScriptBlock};
-#[cfg(feature = "v1")]
-pub use v1::lexer::tokenize;
-#[cfg(feature = "v1")]
-pub use v1::parser::{parse, parse_tokens};
-#[cfg(feature = "v1")]
-pub use v1::tokens::Token;

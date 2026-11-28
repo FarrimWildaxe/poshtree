@@ -8,23 +8,16 @@
 //!    including on malformed input. The test suite enforces this.
 //! 2. **No panics.** Broken input (unterminated strings, dangling escapes)
 //!    produces a [`LexError`] and a best-effort token, never a crash.
-//! 3. **v1-compatible kinds.** Classification matches the v1 lexer where it
-//!    matters for a parser port: the [`KEYWORDS`] and [`NAMED_OPERATORS`]
-//!    tables are equal to v1's (v2 keeps its own copies, locked to v1's by
-//!    a test, so v2 has no compile-time dependency on v1 here), they decide
-//!    `Keyword` vs `Generic` and `Operator` vs `Parameter`,
-//!    `?.`/`?[`/`??`/`??=` are single operators, and the
-//!    `.5`-vs-member-access call uses v1's previous-token rule.
+//! 3. **Token classification.** The [`KEYWORDS`] and [`NAMED_OPERATORS`]
+//!    tables support `Keyword` vs `Generic` and `Operator` vs `Parameter`
+//!    classification. `?.`/`?[`/`??`/`??=` are single operators; the
+//!    `.5`-vs-member-access decision depends on the preceding token and trivia.
 //!
-//! Like v1, this lexer does not model PowerShell's command/expression mode
-//! split; genuinely context-sensitive calls are deferred to the parser.
-//! Where the two lexers disagree, v2 is the more cohesive one (see the
-//! differences list in [`crate::v2`]); where real PowerShell would still
-//! have glued more bytes into one token, the v2 stream contains adjacent
-//! tokens with no trivia between them (`a.span.end == b.span.start`), the
-//! same byte-adjacency signal the v1 parser already uses when it joins
-//! glued tokens. Kind assignment can be heuristic; spans and bytes never
-//! are.
+//! The lexer does not model PowerShell's command/expression mode split;
+//! context-sensitive decisions are deferred to the parser. Where a source
+//! word is split across tokens, byte adjacency (`a.span.end == b.span.start`)
+//! lets the parser rejoin them when needed. See the [lexing details](crate::v2)
+//! for examples. Kind assignment can be heuristic; spans and bytes never are.
 
 use std::convert::Infallible;
 
@@ -42,9 +35,8 @@ pub struct LexOutput {
 /// Lexes `src` into a lossless token stream. The last token is always
 /// [`TokenKind::Eof`]; it carries the file's final trivia.
 ///
-/// Unlike v1's `tokenize`, this does **not** strip a UTF-8
-/// BOM: a leading BOM survives as whitespace trivia on the first token, so
-/// the byte-for-byte invariant holds. Strip it first with
+/// Unlike the former v1 `tokenize`, this retains a leading UTF-8 BOM as
+/// whitespace trivia so reconstruction stays exact. Strip it first with
 /// [`crate::encoding::strip_bom`] if you do not want it in the stream.
 pub fn lex(src: &str) -> LexOutput {
     let mut tokens = Vec::new();
@@ -156,8 +148,7 @@ fn is_named_operator(word: &str) -> bool {
 }
 
 /// Non-newline blank characters that become [`TriviaKind::Whitespace`]. The
-/// BOM is included so a file that starts with one still round-trips; v1
-/// strips it instead.
+/// BOM is included so a file that starts with one still round-trips.
 fn is_blank(c: char) -> bool {
     (c.is_whitespace() && c != '\r' && c != '\n') || c == '\u{feff}'
 }
@@ -192,8 +183,8 @@ fn is_word_continue(c: char) -> bool {
         )
 }
 
-/// The v1 lexer decides `.5`-is-a-number by looking at the previous token:
-/// after one of these kinds, a `.` is member access instead. Same set here.
+/// A `.` after one of these token kinds is member access, even if a digit
+/// follows, unless separating trivia resets the context.
 fn allows_member(kind: TokenKind) -> bool {
     matches!(
         kind,
@@ -206,8 +197,7 @@ fn allows_member(kind: TokenKind) -> bool {
     )
 }
 
-/// Trivia that v1 would have emitted as a `Newline` or `Comment` token,
-/// which resets its member-access context.
+/// Trivia that resets member-access context between significant tokens.
 fn is_separator(kind: TriviaKind) -> bool {
     matches!(
         kind,
@@ -235,10 +225,8 @@ struct Lexer<'a> {
     /// newline or comment was attached there instead of to the next
     /// token's leading trivia).
     pending_separator: bool,
-    /// True when a `.` at the current token would be member access. v1 gets
-    /// this from `tokens.last()`, whose stream still contains `Newline` and
-    /// `Comment` tokens; in v2 those are trivia, so the flag is computed
-    /// from `prev_kind` plus the trivia on both sides of the gap.
+    /// True when a `.` at the current token would be member access, based on
+    /// `prev_kind` and separating trivia on either side of the gap.
     member_context: bool,
 }
 
@@ -353,10 +341,9 @@ impl<'a> Lexer<'a> {
                 return Ok(self.errors);
             }
 
-            // v1 sees Newline and Comment as tokens, and either one resets
-            // its member-access context. Mirror that from the trivia on
-            // both sides of the gap: a newline may sit in the previous
-            // token's trailing trivia or in this token's leading trivia.
+            // A newline or comment resets member-access context whether it
+            // sits in the previous token's trailing trivia or this token's
+            // leading trivia.
             let separated = self.pending_separator || leading_separator;
             self.member_context = !separated && self.prev_kind.is_some_and(allows_member);
 
@@ -997,8 +984,8 @@ impl<'a> Lexer<'a> {
     }
 
     /// Type suffix (`l`, `d`, `u`, `ul`, ...) then multiplier (`kb`..`pb`),
-    /// both case-insensitive, longest match first. A superset of v1, which
-    /// stops at `l`/`d`/`u` plus the multipliers.
+    /// both case-insensitive, longest match first. The former v1 lexer
+    /// recognized only `l`/`d`/`u` plus the multipliers.
     fn scan_number_suffix(&mut self) {
         const TYPES: &[&str] = &["ul", "uy", "us", "u", "l", "y", "s", "n", "d"];
         const MULTIPLIERS: &[&str] = &["kb", "mb", "gb", "tb", "pb"];
@@ -1025,8 +1012,7 @@ impl<'a> Lexer<'a> {
             return TokenKind::Operator; // `..` range
         }
         if !self.member_context && matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-            // `.5` is a number, but `$x.5` is member access; same
-            // previous-token rule as the v1 lexer.
+            // `.5` is a number without the member context present in `$x.5`.
             while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
                 self.bump();
             }
@@ -1105,7 +1091,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn scan_question(&mut self) -> TokenKind {
-        // Multi-char forms first, exactly the set v1 emits as operators.
+        // Match the longest operator form before scanning wildcard words.
         for op in ["??=", "??", "?.", "?["] {
             if self.rest().starts_with(op) {
                 for _ in 0..op.len() {

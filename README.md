@@ -10,14 +10,14 @@ A native recursive-descent parser sits on top and builds nodes with byte spans
 and token ranges. It reports diagnostics and uses error nodes for recovery;
 this is not a guarantee of complete PowerShell grammar coverage or recovery
 for every malformed construct. Exact source reconstruction comes from the
-tokens, not from regenerating code from the AST. The default build has no
+tokens, not from regenerating code from the AST. The crate has no
 external dependencies.
 
 ## Install
 
 ```toml
 [dependencies]
-poshtree = "0.5.0"
+poshtree = "0.6.0"
 ```
 
 Or point at a local checkout:
@@ -34,14 +34,18 @@ The default features are `v2` and `csharp`. The front-end's items live under the
 | --- | --- | --- |
 | `v2` | Yes | Lossless PowerShell tokens, native parser, text edits, and formatter; no external dependencies. |
 | `csharp` | Yes | Bounded C# parsing, extraction, and refactoring for `Add-Type`; enables `v2`, adds no external dependencies. |
-| `v1` | No | Legacy front-end and crate-root re-exports; [repair-only in 0.5](#v1-and-bridge-support-in-05). The only feature that introduces `regex`. |
 
 `csharp` is default-enabled but can be disabled. To use only `v2`:
 
 ```toml
 [dependencies]
-poshtree = { version = "0.5.0", default-features = false, features = ["v2"] }
+poshtree = { version = "0.6.0", default-features = false, features = ["v2"] }
 ```
+
+With all features disabled, `encoding`, `textutil`, `decode_bytes`, and
+`strip_bom` remain available. Upgrading from 0.5? See
+[v1 and bridge removal in 0.6.0](#v1-and-bridge-removal-in-060) for the full
+feature matrix, migration guidance, and an exact rollback pin.
 
 ## Lossless tokens
 
@@ -72,10 +76,9 @@ staying a single token; the module docs spell those out.
 
 The v2 lexer scans nested double-quoted strings and their `$()` subexpressions
 with private, input-bounded heap frames rather than recursive calls. Token text,
-trivia, byte spans, and malformed-input diagnostic order are unchanged. This
-retains v2's existing boundary rules, not the broader legacy v1 scanner grammar:
-block comments stop at the first `#>`, and here-string bodies are scanned
-verbatim. It adds no fixed lexical nesting limit or input/memory quota; frame
+trivia, byte spans, and malformed-input diagnostic order are unchanged. Block
+comments still stop at the first `#>`, and here-string bodies are scanned
+verbatim. The lexer adds no fixed lexical nesting limit or input/memory quota; frame
 storage grows with nesting, and unclosed contexts can each produce a diagnostic.
 This is lexical boundary scanning only, not a stack-safety guarantee for parsing,
 walking, or dropping arbitrary trees.
@@ -151,8 +154,8 @@ token ranges at the enclosing string token, including for empty fragments.
 Boundary-probe and fragment diagnostics remain local, not new outer errors.
 `parse` still includes outer lexer errors; `parse_tokens` still does not.
 
-This shares v2's existing grammar, not v1's broader scanner semantics: block
-comments end at the first `#>`, and here-string bodies are scanned verbatim.
+This shares the lexer's existing grammar: block comments end at the first
+`#>`, and here-string bodies are scanned verbatim.
 Fragment parsers now inherit the enclosing statement/expression depth, including
 across nested detached fragments, rather than starting a fresh budget. Public
 `parse` and `parse_tokens` start at depth zero. The existing statement/primary
@@ -165,41 +168,7 @@ depth 64 or above silently have no parts, including variable parts, even if thei
 raw bodies contain interpolation. Below 64, extracted fragments can still reach
 the statement/expression limit. These are syntactic nesting guards, not complete
 grammar or semantic validation, an input/memory quota, or an arbitrary-tree
-parse/walk/drop stack-safety guarantee. They do not change v1 or other reparsers.
-
-### Legacy v1 raw interpolation
-
-With the opt-in `v1` feature, double-quoted strings and double-quoted here-strings
-recognize interpolation from their raw body, before legacy decoding can erase
-escape distinctions, not from the decoded `value`. Each backtick skips the next
-raw character: an odd run escapes a following `$`, and an even run leaves it
-active. Escaped dollars produce no parts. Any unescaped dollar sets `expandable`,
-but only supported variable references and `$()` subexpressions produce `parts`,
-in source order; unsupported dollars can set the flag without producing a part.
-Single-quoted forms remain literal. This describes v1, not a change to v2.
-
-The v1 lexer and parser share an iterative, heap-framed `$()` boundary scanner.
-It balances code parentheses while respecting backtick escapes, single/double
-quotes and doubled quotes, line comments, nested block comments, and here-strings,
-including nested subexpressions in expandable strings. Quoted/commented
-parentheses do not close the surrounding subexpression. This lexical scan is
-not full PowerShell grammar validation, and fragment parsing still uses the
-legacy lexer.
-
-Closed fragments are parsed from their raw interior; unclosed fragments are
-parsed best-effort from exactly the available remainder, without a fabricated
-closing delimiter. Recovery can retain fragment error nodes, but fragment
-diagnostics and the overflow latch stay local rather than being merged into the
-outer parser's errors. Fragment parsers inherit the enclosing
-statement/expression depth, including nested interpolation: depth 100 is allowed,
-and the next guarded entry is rejected instead of receiving a fresh budget.
-
-The stored `raw`, legacy-decoded `value`, and existing here-string newline
-trimming are unchanged. v1 locations remain coarse: interpolation variables and
-subexpression wrappers use the enclosing string's location, while fragment
-contents can retain fragment-local locations. This does not provide precise
-fragment spans, a decoded-text source map, or a guarantee of full PowerShell
-runtime string decoding.
+parse/walk/drop stack-safety guarantee.
 
 ## C# in Add-Type
 
@@ -213,32 +182,28 @@ lossless C# AST unparser, a full C# compiler, or a whole-program semantic rename
 
 ### PowerShell source eligibility and cache
 
-Both PowerShell parsers extract from eligible literals directly or from a
+The PowerShell parser extracts from eligible literals directly or from a
 parser-local cache for plain, unscoped variables. Recognized assignments
 (`=`, `+=`, `-=`, `*=`, `/=`, `%=`, `??=`) invalidate the target's cache entry
 after parsing the RHS; an `Add-Type` on the RHS can still use the old entry.
 Prefix/postfix `++` and `--` also invalidate the affected variable. Only `=`
 with an eligible string-literal RHS installs or restores an entry. Writes to
-other variables do not clear it. The opt-in v1 lexer now recognizes `-=` as
-an operator, including in `$x-=1`, so that write reaches this invalidation path.
+other variables do not clear it.
 
 Single-quoted strings and single-quoted here-strings are eligible.
 Double-quoted strings and here-strings are conservatively rejected if their
 raw spelling contains an unescaped `$`: the check skips the character after
 each backtick, independently of `expandable` and the incomplete
-interpolation-parts list. v1 raw interpolation recognition does not relax this
-conservative eligibility check.
+interpolation-parts list.
 Unknown variables and rejected strings do not supply confirmed C# metadata.
 Missing metadata is not a safety verdict or proof that `Add-Type` is absent
 or cannot execute.
 
 This is a bounded syntactic cache in linear parser traversal order, not scope,
 branch, function, or dataflow analysis; it does not track indirect writes or
-alternate runtime values. Eligibility does not improve string decoding or
-source mapping: v1 retains its existing lexer-decoded string values and
-locations, while v2 extracts the delimiter-stripped raw body and its span,
-not a fully decoded PowerShell runtime string or a general decoded-text source
-map.
+alternate runtime values. The parser extracts the delimiter-stripped raw body
+and its span, not a fully decoded PowerShell runtime string or a general
+decoded-text source map.
 
 ### C# parsing and refactoring bounds
 
@@ -302,7 +267,7 @@ array suffixes (`[]`, `[,]`, and other ranks), nullable `?`, and pointer `*`
 suffixes. Source spelling, including internal whitespace and comments, is
 preserved; attributes, declaration/parameter modifiers, and parameter defaults
 are excluded. This guarantee applies only to the `csharp` front-end, not to
-legacy `v1` extraction or the fallback scanner used without `csharp`.
+the fallback scanner used without `csharp`.
 
 This is bounded syntactic extraction, not semantic type resolution or validation
 of executable P/Invoke signatures or marshalling types. Only methods and
@@ -423,7 +388,7 @@ as `if(`.
 
 ## Diagnostic rendering from a v2 AST
 
-With `v2` enabled (no `v1` or `csharp` required), use
+With `v2` enabled (`csharp` is not required), use
 `poshtree::v2::write_diagnostic_script` when you have only a native v2 script
 tree, including one you built or modified. It reads the node kinds and their
 current values and order, not source text, tokens, spans, or token ranges.
@@ -507,7 +472,7 @@ Other supported statements include bounded expressions, `=` assignments to
 simple variables, plain commands, and pipelines of at least two plain commands.
 Plain commands cannot have invocation operators, redirections, or C# metadata.
 Check the [`poshtree::v2::write_diagnostic_script` rustdoc](src/v2/render.rs)
-for the exact node and field restrictions before switching a legacy caller.
+for the exact node and field restrictions.
 
 The writer checks the entire tree before writing: unsupported nodes or fields
 return an `io::Error` of kind `InvalidInput` containing
@@ -515,15 +480,14 @@ return an `io::Error` of kind `InvalidInput` containing
 errors are returned unchanged and can leave partial output; the function does
 not flush the writer or roll back writes.
 
-This is not lossless rendering, the v1 bridge, or a drop-in legacy unparser.
-It does not guarantee that the output reparses, is valid or executable
+This is not lossless rendering or a drop-in replacement for the former v1
+unparser. It does not guarantee that the output reparses, is valid or executable
 PowerShell, or preserves semantics. Use `reconstruct` for byte-exact token
 replay, `format_source` for checked formatting, or `apply_edits` for targeted
 edits against original text.
 
-If a consumer still needs legacy behavior, explicitly choose the opt-in `v1`
-workflow rather than automatically falling back on a render error. See
-[v1 and bridge support in 0.5](#v1-and-bridge-support-in-05) for the compatibility
+There is no legacy fallback on a render error. See
+[the 0.6.0 removal notice](#v1-and-bridge-removal-in-060) for the compatibility
 boundary.
 
 ## Examples
@@ -582,88 +546,81 @@ $ cargo run --example scope-rename
 
 ## Versioning
 
-Sibling front-end namespaces let different token and tree designs coexist;
-the current default is `v2`. These namespaces do not rule out justified
-crate-level breaking releases. During `0.x` development, such changes use a
-minor-version bump and include migration guidance.
+During `0.x` development, breaking changes use a minor-version bump and
+include migration guidance.
 
-### v1 and bridge support in 0.5
+### v1 and bridge removal in 0.6.0
 
-The opt-in `poshtree::v1` front end, its flat crate-root exports (including
-`parse`, `parse_tokens`, and `tokenize`), the legacy `poshtree::unparse` API
-(including `dump_ast_to_ps1` at both paths), and the `poshtree::v2::tree`
-bridge and its `v2` re-exports are **deprecated in documentation only**.
-They remain available and **repair-only throughout 0.5**: fixes only, no
-new functionality or compiler deprecation warnings. The documentation notice
-does not change signatures, behavior, feature gates, or defaults.
+Version 0.6.0 removes the `v1` feature, `poshtree::v1`, `poshtree::unparse`,
+their flat crate-root exports (including `tokenize`, `parse`, `parse_tokens`,
+and `dump_ast_to_ps1`), and the `poshtree::v2::tree` bridge and its `v2`
+re-exports (`parse_with_tokens`, `Tree`, and `TreeNode`). There are no
+compatibility aliases for the feature or the removed APIs. Remove `v1` from
+your 0.6 dependency's feature list. The native `v2` APIs and default feature
+selection are unchanged.
 
-| Cargo selection | Support in 0.5 |
+| Cargo selection | Support in 0.6 |
 | --- | --- |
-| Defaults | Native `v2` and `v2::csharp`; no v1 or bridge. |
-| `--no-default-features` | Shared utilities only; neither front end. |
-| `--no-default-features --features v1` | Repair-only v1, legacy unparse and root exports; no bridge. |
-| `--no-default-features --features v2` | Native `v2` with fallback `Add-Type` import scanning; no bridge or C# front end. |
+| Defaults or `--all-features` | Native `v2` and `v2::csharp`. |
+| `--no-default-features` | Shared utilities only. |
+| `--no-default-features --features v2` | Native `v2` with fallback `Add-Type` import scanning; no C# front end. |
 | `--no-default-features --features csharp` | Same as defaults: `csharp` enables `v2`. |
-| `--no-default-features --features v1,v2` | Native `v2` with fallback `Add-Type` scanning, repair-only v1 and bridge. |
-| `--no-default-features --features v1,csharp` | All three features, as with `--all-features`; v1 and the bridge are repair-only. |
 
 For native workflows, choose the API that matches the input and goal:
 
 | Goal | Native API |
 | --- | --- |
-| Render a supported, possibly edited AST for diagnostics | [`poshtree::v2::write_diagnostic_script`](#diagnostic-rendering-from-a-v2-ast) reads the current AST, not tokens, and refuses unsupported trees. |
+| Render a supported, possibly edited AST for diagnostics | [`poshtree::v2::write_diagnostic_script`](#diagnostic-rendering-from-a-v2-ast) emits bounded diagnostic text. Unsupported trees return an `InvalidInput` error containing `DiagnosticRenderError` before any write; an I/O failure can leave partial output. |
 | Replay the original bytes, including trivia | [`poshtree::v2::reconstruct`](#lossless-tokens) replays retained tokens, not AST edits. |
 | Reformat source with syntactic checks | [`poshtree::v2::format_source`](#formatting) formats source text, not an AST. |
 | Make targeted edits to original source | [`poshtree::v2::apply_edits`](#lossless-tokens) applies explicit byte-span replacements. |
 
 When moving off `v1`, switch to qualified native imports such as
-`poshtree::v2::lex` and `poshtree::v2::parse`. Disabling `v1` removes the
-legacy crate-root exports; it does not redirect them to `v2`. Some workflows
-have no drop-in native replacement:
+`poshtree::v2::lex` and `poshtree::v2::parse`. Native tokens carry trivia and
+use UTF-8 byte spans into the original input, including any leading BOM;
+`LineIndex` derives line and byte column on demand. Do not assume the same
+token stream, positions, or traversal order as in v1 or the bridge. Some
+workflows have no drop-in native replacement:
 
-- **Error-tolerant source dump:** Keep the legacy dump if you rely on its
-  parse-error tolerance or emitted bytes. The native diagnostic writer takes
-  a tree, not source, and only renders its supported subset.
+- **Error-tolerant source dump:** `write_diagnostic_script` takes a tree, not
+  source. Handle parse diagnostics separately; the writer does not reproduce
+  `dump_ast_to_ps1`'s parse-error tolerance or emitted bytes and does not
+  guarantee faithful source or executable PowerShell.
 - **Byte-preserving comment masking:** If v2's comment recognition fits your
   needs, use comment trivia spans from `poshtree::v2::lex` to replace comment
-  bytes with spaces while preserving CR and LF. Keep `v1` if you need its
-  exact comment recognition and masking.
+  bytes with spaces while preserving CR and LF. There is no exact replacement
+  for v1's `strip_comments` and `strip_comments_tokens` behavior.
 - **Bridge traversal:** Use `poshtree::v2::parse` and
-  `poshtree::v2::Node::walk_with_ancestors` for native traversal. Adapt to
-  native node types and child order, and compute any trivia-inclusive source
-  ranges you need from the retained tokens. Keep the bridge if you need its
-  zipped typed v1 visitors or scalar summaries.
-- **One-call C# extraction:** For [recognized `Add-Type` forms](#powershell-source-eligibility-and-cache),
-  inspect `poshtree::v2::NodeKind::CSharpMemberDef` for native metadata.
-  `v2` alone uses a fallback import scanner; `csharp` adds bounded parsed
-  extraction and richer type spellings. Neither promises the legacy
-  extractor's results.
+  `poshtree::v2::Node::walk_with_ancestors` for a depth-first walk of native
+  nodes with root-first ancestor paths. Adapt to native node types and child
+  order. There are no zipped typed v1 visitors, scalar summaries, or the
+  bridge's trivia-inclusive footprints; if you need trivia coverage, inspect
+  the retained tokens and define your own range policy.
+- **One-call C# extraction:** There is no drop-in for
+  `poshtree::v1::parser::parse_csharp_member_def` on raw C#. When starting
+  from PowerShell, inspect `poshtree::v2::NodeKind::CSharpMemberDef` for
+  metadata from [recognized `Add-Type` forms](#powershell-source-eligibility-and-cache).
+  `v2` alone scans for `[DllImport]` signatures with a fallback scanner.
+  With `csharp`, the import metadata comes from a bounded C# parse with richer
+  supported type spellings. Neither promises the legacy extractor's results.
 
-These APIs will not be removed before **0.6.0**. If you still need them, pin
-a known-compatible 0.5 release or Git revision with `v1` enabled (and `v2`
-for the bridge).
+#### Roll back to 0.5.0
 
-### Migrating to 0.5.0
+If you still need the removed behavior, replace the 0.6 dependency with a Git
+dependency pinned to the exact commit tagged `v0.5.0`:
 
-Both `poshtree::dump_ast_to_ps1` and
-`poshtree::unparse::dump_ast_to_ps1` now return `std::io::Result<()>` instead
-of `()`. Both paths still require the opt-in `v1` feature. Enable it in your
-dependency's `features` list and propagate write errors with `?`, or handle
-them explicitly:
-
-```rust
-fn dump(source: &str, writer: &mut impl std::io::Write) -> std::io::Result<()> {
-    poshtree::dump_ast_to_ps1(source, writer)?;
-    Ok(())
-}
+```toml
+[dependencies]
+poshtree = { git = "https://github.com/FarrimWildaxe/poshtree.git", rev = "34131a6e5022dfbc42e82a04c59f1d2da984eff3", default-features = false, features = ["v1"] }
 ```
 
-Writer errors are no longer silently discarded. An error may leave partial
-output; the function does not roll it back or flush the writer. Parse-error
-tolerance and emitted bytes are unchanged. The legacy unparser is diagnostic,
-not lossless: its output is not guaranteed semantically equivalent to the
-input or executable PowerShell. Use the `v2` token reconstruction API when
-you need lossless output.
+Use `features = ["v1", "v2"]` if you need the bridge. If you also used the
+default C# front end, include `csharp`. Update your application's lockfile
+to use the pinned dependency. On the 0.5 line, v1 and the bridge are
+repair-only: fixes, not new functionality. The exact Git pin does not track
+later 0.5 changes.
+
+### Native API changes in 0.5.0
 
 `poshtree::v2::EditError` now includes `InvalidRange(Span)`. Exhaustive matches
 on `EditError` must handle this new variant. `apply_edits` now rejects

@@ -80,7 +80,7 @@ fn decode_inner(data: &[u8]) -> String {
 ///
 /// Invalid sequences are replaced with `U+FFFD` rather than rejected, and any
 /// leading BOM is removed, so the result is ready to pass straight to the
-/// lexer/parser (v1 or v2). Encodings other than UTF-8 and UTF-16 (for example
+/// lexer or parser. Encodings other than UTF-8 and UTF-16 (for example
 /// UTF-32) fall back to a lossy UTF-8 reading.
 pub fn decode_bytes(data: &[u8]) -> String {
     let s = decode_inner(data);

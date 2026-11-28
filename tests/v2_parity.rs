@@ -1,286 +1,18 @@
-//! Native v2 parser regressions and differential checks against v1.
+//! Native v2 parser regressions.
 //!
-//! With `v1` enabled, both trees are reduced to a canonical label skeleton and
-//! compared. The v1 side is read straight from the correlation `TreeNode`,
-//! whose children mirror `AstNode::safe_children`. For the comparison, the v2
-//! side applies the same rules: control-flow and block bodies are inlined
-//! (no wrapper node), a `param` block sorts last among its siblings, a command
-//! name counts as a child only under `&`/`.` invocation, and a redirection
-//! contributes its target rather than a node of its own.
-//!
-//! This bounded corpus samples grammar constructs; it does not establish
-//! complete grammar equivalence. It includes two pieces of derived metadata:
-//! a double-quoted string's interpolation `parts` (children of the
-//! `StringLiteral`) and `Add-Type`'s extracted `CSharpMemberDef` child.
-//! Independent literals anchor the native child order and fields without
-//! normalizing to v1, and the legacy projections while v1 is supported.
-//!
-//! Known lexical differences are also out of scope: where the two lexers
-//! tokenize differently, the parse trees differ in turn. A pure dotted run
-//! like `a.b.c` is one v2 token, and a leading-slash bareword like `/tmp` is
-//! one v2 `Generic` where v1 sees a `/` operator followed by a word (so v1
-//! does not bind it as a parameter argument). The corpus avoids those.
+//! The corpus checks for clean parsing across a bounded sample of the grammar.
+//! Independent literals anchor native child order and selected AST fields,
+//! including string interpolation, as well as complete `Add-Type` metadata.
 #![cfg(feature = "v2")]
 
-#[cfg(feature = "v1")]
-use poshtree::v2::tree::{parse_with_tokens, TreeNode};
 use poshtree::v2::{parse, CSharpImport, CSharpMemberDef, CSharpParam, Node, NodeKind, Span};
 
-// V1 skeleton, straight from the correlation tree
-
-#[cfg(feature = "v1")]
-fn skel_v1(n: &TreeNode) -> String {
-    if n.children.is_empty() {
-        n.label.to_string()
-    } else {
-        let kids: Vec<String> = n.children.iter().map(skel_v1).collect();
-        format!("{}[{}]", n.label, kids.join(","))
-    }
-}
-
-// V2 skeleton, applying v1's safe_children rules
-
-#[cfg(feature = "v1")]
-fn stmts_of(n: &Node) -> &[Node] {
-    if let NodeKind::Script(v) = &n.kind {
-        v
-    } else {
-        &[]
-    }
-}
-
-/// Statement skeletons with a `param` block moved to the end, matching v1's
-/// ScriptBlock, which stores the param block separately and lists it last.
-#[cfg(feature = "v1")]
-fn block(stmts: &[Node]) -> Vec<String> {
-    let mut normal = Vec::new();
-    let mut params = Vec::new();
-    for s in stmts {
-        if matches!(s.kind, NodeKind::ParamBlock(_)) {
-            params.push(skel_v2(s));
-        } else {
-            normal.push(skel_v2(s));
-        }
-    }
-    normal.extend(params);
-    normal
-}
-
-#[cfg(feature = "v1")]
-fn kids_v2(n: &Node) -> Vec<String> {
-    use NodeKind::*;
-    match &n.kind {
-        Script(v) => block(v),
-        ParamBlock(v) | Pipeline(v) | Array(v) | ArrayLiteral(v) => v.iter().map(skel_v2).collect(),
-        ClassDefinition { members, .. } | EnumDefinition { members, .. } => {
-            members.iter().map(skel_v2).collect()
-        }
-        PipelineChain { left, right, .. } => vec![skel_v2(left), skel_v2(right)],
-        Command {
-            name,
-            invocation,
-            elements,
-            redirections,
-            csharp,
-        } => {
-            let mut k = Vec::new();
-            if *invocation {
-                k.push(skel_v2(name));
-            }
-            for e in elements {
-                k.push(skel_v2(e));
-            }
-            if let Some(cs) = csharp {
-                k.push(skel_v2(cs));
-            }
-            for r in redirections {
-                if let Redirection {
-                    target: Some(t), ..
-                } = &r.kind
-                {
-                    k.push(skel_v2(t));
-                }
-            }
-            k
-        }
-        CSharpMemberDef(_) => Vec::new(),
-        CommandParameter { argument, .. } => argument.iter().map(|a| skel_v2(a)).collect(),
-        Redirection { target, .. } => target.iter().map(|t| skel_v2(t)).collect(),
-        Assignment { target, value, .. } => vec![skel_v2(target), skel_v2(value)],
-        If {
-            conditions,
-            blocks,
-            else_block,
-        } => {
-            let mut k = Vec::new();
-            for (c, b) in conditions.iter().zip(blocks.iter()) {
-                k.push(skel_v2(c));
-                k.extend(block(stmts_of(b)));
-            }
-            if let Some(e) = else_block {
-                k.extend(block(stmts_of(e)));
-            }
-            k
-        }
-        While { condition, body } => {
-            let mut k = vec![skel_v2(condition)];
-            k.extend(block(stmts_of(body)));
-            k
-        }
-        DoWhile {
-            body, condition, ..
-        } => {
-            let mut k = vec![skel_v2(condition)];
-            k.extend(block(stmts_of(body)));
-            k
-        }
-        For {
-            init,
-            condition,
-            update,
-            body,
-        } => {
-            let mut k = Vec::new();
-            if let Some(x) = init {
-                k.push(skel_v2(x));
-            }
-            if let Some(x) = condition {
-                k.push(skel_v2(x));
-            }
-            if let Some(x) = update {
-                k.push(skel_v2(x));
-            }
-            k.extend(block(stmts_of(body)));
-            k
-        }
-        ForEach {
-            variable,
-            iterable,
-            body,
-        } => {
-            let mut k = vec![skel_v2(variable), skel_v2(iterable)];
-            k.extend(block(stmts_of(body)));
-            k
-        }
-        Switch { input, cases, .. } => {
-            let mut k = vec![skel_v2(input)];
-            for c in cases {
-                k.extend(block(stmts_of(c)));
-            }
-            k
-        }
-        Function { body, .. } => block(stmts_of(body)),
-        Try {
-            body,
-            catches,
-            finally_block,
-        } => {
-            let mut k = block(stmts_of(body));
-            for c in catches {
-                if let Catch { body } = &c.kind {
-                    k.extend(block(stmts_of(body)));
-                }
-            }
-            if let Some(f) = finally_block {
-                k.extend(block(stmts_of(f)));
-            }
-            k
-        }
-        Catch { body } => block(stmts_of(body)),
-        ClassMember {
-            parameters,
-            default,
-            body,
-            ..
-        } => {
-            let mut k: Vec<String> = parameters.iter().map(skel_v2).collect();
-            if let Some(d) = default {
-                k.push(skel_v2(d));
-            }
-            if let Some(b) = body {
-                k.extend(block(stmts_of(b)));
-            }
-            k
-        }
-        Flow { keyword, value } => {
-            if keyword == "return" || keyword == "throw" {
-                value.iter().map(|v| skel_v2(v)).collect()
-            } else {
-                Vec::new()
-            }
-        }
-        Ternary {
-            condition,
-            if_true,
-            if_false,
-        } => vec![skel_v2(condition), skel_v2(if_true), skel_v2(if_false)],
-        Binary { left, right, .. } => vec![skel_v2(left), skel_v2(right)],
-        Unary { operand, .. } | PostfixUnary { operand, .. } | Cast { operand, .. } => {
-            vec![skel_v2(operand)]
-        }
-        MemberAccess { target, .. } => vec![skel_v2(target)],
-        InvokeMember { target, args, .. } => {
-            let mut k = vec![skel_v2(target)];
-            k.extend(args.iter().map(skel_v2));
-            k
-        }
-        Index { target, index } => vec![skel_v2(target), skel_v2(index)],
-        Paren(inner) => vec![skel_v2(inner)],
-        SubExpression(s) | ScriptBlockExpression(s) => block(stmts_of(s)),
-        Hashtable(pairs) => {
-            let mut k = Vec::new();
-            for (a, b) in pairs {
-                k.push(skel_v2(a));
-                k.push(skel_v2(b));
-            }
-            k
-        }
-        StringLiteral { parts, .. } => parts.iter().map(skel_v2).collect(),
-        Using { .. } | Variable(_) | Number(_) | TypeExpression(_) | BareWord(_) | Error(_) => {
-            Vec::new()
-        }
-        // NodeKind is non-exhaustive; any variant without its own skeleton
-        // contributes no children here.
-        _ => Vec::new(),
-    }
-}
-
-#[cfg(feature = "v1")]
-fn skel_v2(n: &Node) -> String {
-    use NodeKind::*;
-    // The v1 parser does not model parameter metadata; it emits a bare
-    // variable for each parameter slot. Render a v2 Parameter the same way so
-    // the shared structure still compares equal (the attributes and default
-    // are a v2-only enrichment, checked by their own tests).
-    if matches!(n.kind, Parameter { .. }) {
-        return "Variable".to_string();
-    }
-    let k = kids_v2(n);
-    if k.is_empty() {
-        n.label().to_string()
-    } else {
-        format!("{}[{}]", n.label(), k.join(","))
-    }
-}
-
-#[cfg(feature = "v1")]
-fn assert_parity(src: &str) {
+fn parse_without_diagnostics(src: &str) {
     let out = parse(src);
-    assert!(
-        out.errors.is_empty(),
-        "native parse errors for {src:?}: {:?}",
-        out.errors
-    );
-    let tree = parse_with_tokens(src);
-    let v1 = skel_v1(&tree.root);
-    let v2 = skel_v2(&out.script);
-    assert_eq!(
-        v1, v2,
-        "skeleton mismatch for {src:?}\n v1: {v1}\n v2: {v2}"
-    );
+
+    assert_eq!(out.errors, [], "native parse diagnostics for {src:?}");
 }
 
-#[cfg(feature = "v1")]
 const CORPUS: &[&str] = &[
     // pipelines, commands, parameters with bound arguments, redirections
     "Get-ChildItem -Path 'C:\\tmp' -Recurse | Sort-Object Length\n",
@@ -341,7 +73,7 @@ const CORPUS: &[&str] = &[
     "enum Size : int { Small = 1; Large = 100 }\n",
     "class Point { [int]$X; [int]$Y; Point([int]$x, [int]$y) { $this.X = $x; $this.Y = $y } [int] Sum() { return $this.X + $this.Y } }\n",
     "class Derived : Base { static [int]$Count; [string] Describe() { return 'd' } }\n",
-    // param block placement (param sorts last in the skeleton)
+    // param block placement
     "param($a, $b)\nWrite-Output $a\n",
     // nesting
     "if ($a) { foreach ($i in 1, 2) { if ($i) { Write-Output $i } } }\n",
@@ -357,7 +89,7 @@ const CORPUS: &[&str] = &[
     "$p = $a * $b + $c / $d - $e % $f\n",
     // nested member/index/invoke chains (the v2 lexer groups a pure dotted
     // run like `a.b.c` into one token, so chains here are broken by brackets
-    // or calls, where v1 and v2 tokenize alike)
+    // or calls)
     "$idx = $a[$i + 1]\n",
     "$chain = $obj.Items[0].Name\n",
     "$call = [System.Math]::Floor($x).ToString()\n",
@@ -410,56 +142,40 @@ const CORPUS: &[&str] = &[
     "Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern int MessageBox(IntPtr h, string t, string c, int o);' -Name Win -Namespace N\n",
 ];
 
-#[cfg(feature = "v1")]
 #[test]
-fn native_parser_matches_v1_tree_shape() {
+fn native_parser_reports_no_diagnostics_for_corpus() {
     for src in CORPUS {
-        assert_parity(src);
+        parse_without_diagnostics(src);
     }
 }
 
-// Hand-written anchors for the same sources: legacy projection, then native
-// traversal with selected payloads. Neither expectation is derived from
-// the other tree.
-const SKELETON_CASES: &[(&str, &str, &str)] = &[
+// Hand-written native traversal expectations with selected payloads.
+const SKELETON_CASES: &[(&str, &str)] = &[
     (
         "$x = 1 + 2 * 3\n",
-        "ScriptBlock[AssignmentStatement[Variable,BinaryExpression[NumberLiteral,BinaryExpression[NumberLiteral,NumberLiteral]]]]",
         "ScriptBlock[AssignmentStatement(=)[Variable($x),BinaryExpression(+)[NumberLiteral(1),BinaryExpression(*)[NumberLiteral(2),NumberLiteral(3)]]]]",
     ),
     (
         "Get-Content in.txt > out.txt\n",
-        "ScriptBlock[Command[BareWord,BareWord]]",
         "ScriptBlock[Command(direct)[BareWord(Get-Content),BareWord(in.txt),Redirection(>)[BareWord(out.txt)]]]",
     ),
     (
         "& $command -Arg value\n",
-        "ScriptBlock[Command[Variable,CommandParameter[BareWord]]]",
         "ScriptBlock[Command(invoked)[Variable($command),CommandParameter(Arg)[BareWord(value)]]]",
     ),
     (
         "if ($x -gt 1) { 'big' } elseif ($x -eq 1) { 'one' } else { 'small' }\n",
-        "ScriptBlock[IfStatement[BinaryExpression[Variable,NumberLiteral],StringLiteral,BinaryExpression[Variable,NumberLiteral],StringLiteral,StringLiteral]]",
         "ScriptBlock[IfStatement(2 guards,2 blocks,else=true)[BinaryExpression(-gt)[Variable($x),NumberLiteral(1)],BinaryExpression(-eq)[Variable($x),NumberLiteral(1)],ScriptBlock[StringLiteral(Single:'big')],ScriptBlock[StringLiteral(Single:'one')],ScriptBlock[StringLiteral(Single:'small')]]]",
     ),
     (
         "function Get-Thing { param([string]$Name, [int]$Count = 3) $Name }\n",
-        "ScriptBlock[FunctionDefinition[Variable,ParamBlock[Variable,Variable]]]",
         "ScriptBlock[FunctionDefinition(Get-Thing)[ScriptBlock[ParamBlock[Parameter($Name)[TypeExpression(string)],Parameter($Count)[TypeExpression(int),NumberLiteral(3)]],Variable($Name)]]]",
     ),
     (
         "$s2 = \"value is $($x.Prop)\"\n",
-        "ScriptBlock[AssignmentStatement[Variable,StringLiteral[SubExpression[MemberAccess[Variable]]]]]",
         "ScriptBlock[AssignmentStatement(=)[Variable($s2),StringLiteral(Double:\"value is $($x.Prop)\")[SubExpression[ScriptBlock[MemberAccess(Prop)[Variable($x)]]]]]]",
     ),
 ];
-
-#[cfg(feature = "v1")]
-fn assert_v1_skeleton_literal(src: &str, expected: &str) {
-    let tree = parse_with_tokens(src);
-
-    assert_eq!(skel_v1(&tree.root), expected, "v1 skeleton for {src:?}");
-}
 
 fn native_skeleton(n: &Node) -> String {
     use NodeKind::*;
@@ -516,17 +232,9 @@ fn assert_v2_skeleton_literal(src: &str, expected: &str) {
     );
 }
 
-#[cfg(feature = "v1")]
-#[test]
-fn v1_parser_matches_literal_skeletons() {
-    for &(src, expected, _) in SKELETON_CASES {
-        assert_v1_skeleton_literal(src, expected);
-    }
-}
-
 #[test]
 fn native_parser_matches_literal_skeletons() {
-    for &(src, _, expected) in SKELETON_CASES {
+    for &(src, expected) in SKELETON_CASES {
         assert_v2_skeleton_literal(src, expected);
     }
 }
@@ -591,51 +299,6 @@ const CSHARP_CASES: &[CSharpCase] = &[
     },
 ];
 
-#[cfg(feature = "v1")]
-fn v1_csharp_metadata(ast: &poshtree::v1::ast::AstNode) -> Option<(String, Vec<String>, String)> {
-    use poshtree::v1::ast::AstNode;
-
-    fn walk(n: &AstNode, out: &mut Option<(String, Vec<String>, String)>) {
-        if let AstNode::CSharpMemberDef(c) = n {
-            *out = Some((c.code.clone(), c.apis.clone(), c.parameter.clone()));
-        }
-        for ch in n.safe_children() {
-            walk(ch, out);
-        }
-    }
-    let mut metadata = None;
-    walk(ast, &mut metadata);
-    metadata
-}
-
-#[cfg(feature = "v1")]
-fn v2_csharp_metadata(script: &Node) -> Option<(String, Vec<String>, String)> {
-    let mut metadata = None;
-    script.walk(&mut |n| {
-        if let NodeKind::CSharpMemberDef(c) = &n.kind {
-            metadata = Some((c.code.clone(), c.apis.clone(), c.parameter.clone()));
-        }
-    });
-    metadata
-}
-
-#[cfg(feature = "v1")]
-fn assert_v1_csharp_literal(src: &str, code: &str, apis: &[&str], parameter: &str) {
-    let expected = Some((
-        code.to_string(),
-        apis.iter().map(|api| api.to_string()).collect(),
-        parameter.to_string(),
-    ));
-
-    let tree = parse_with_tokens(src);
-
-    assert_eq!(
-        v1_csharp_metadata(&tree.ast),
-        expected,
-        "v1 Add-Type extraction for {src:?}"
-    );
-}
-
 fn assert_v2_csharp_literal(case: &CSharpCase) {
     let src = case.src;
     let expected = CSharpMemberDef {
@@ -678,37 +341,9 @@ fn assert_v2_csharp_literal(case: &CSharpCase) {
     assert_eq!(metadata, [expected], "v2 Add-Type extraction for {src:?}");
 }
 
-#[cfg(feature = "v1")]
-#[test]
-fn v1_parser_matches_literal_csharp_extraction() {
-    for case in CSHARP_CASES {
-        assert_v1_csharp_literal(case.src, case.code, case.apis, case.parameter);
-    }
-}
-
 #[test]
 fn native_parser_matches_literal_csharp_extraction() {
     for case in CSHARP_CASES {
         assert_v2_csharp_literal(case);
-    }
-}
-
-/// The skeleton test only proves a `CSharpMemberDef` node exists; this one
-/// compares the extracted code, apis, and parameter against v1's values.
-#[cfg(feature = "v1")]
-#[test]
-fn native_parser_matches_v1_csharp_extraction() {
-    for case in CSHARP_CASES {
-        let src = case.src;
-        // v1 metadata
-        let tree = parse_with_tokens(src);
-        let v1_meta = v1_csharp_metadata(&tree.ast);
-
-        // v2 metadata
-        let out = parse(src);
-        let v2_meta = v2_csharp_metadata(&out.script);
-
-        assert_eq!(v1_meta, v2_meta, "Add-Type extraction differs for {src:?}");
-        assert!(v2_meta.is_some(), "expected a CSharpMemberDef for {src:?}");
     }
 }

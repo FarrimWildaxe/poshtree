@@ -1,8 +1,8 @@
 [package]
 name        = "poshtree"
-version     = "0.5.0"
+version     = "0.6.0"
 edition     = "2021"
-description = "PowerShell syntax tree: tokenizer, parser, AST, and unparser"
+description = "PowerShell syntax tooling: lossless tokens, parser, span edits, and formatter"
 license     = "MIT"
 keywords    = ["powershell", "parser", "ast", "lexer", "syntax-tree"]
 categories  = ["parser-implementations", "development-tools"]
@@ -16,7 +16,7 @@ repository  = "https://github.com/FarrimWildaxe/poshtree"
 [workspace]
 
 [features]
-# v2 and csharp are enabled by default; v1 is opt-in.
+# v2 and csharp are enabled by default.
 default = ["v2", "csharp"]
 # The lossless layer: trivia-bearing tokens, byte spans, text edits, a native
 # recursive-descent parser, and a formatter. Zero dependencies.
@@ -25,15 +25,6 @@ v2 = []
 # bounded C#-aware refactors). Default-enabled but can be disabled; enables v2
 # and adds no external dependencies.
 csharp = ["v2"]
-# Legacy front-end: tokenizer, AST, parser, unparser. Off by default. Owns the
-# only dependency (`regex`, used by the v1 parser for Add-Type C# extraction;
-# no v2 code uses regex). `v2::tree` runs the v1 parser to recover token
-# ranges, so it needs this feature; regex tags along only as v1's internal
-# implementation detail.
-v1 = ["dep:regex"]
-
-[dependencies]
-regex = { version = "1", optional = true }
 
 # Standalone-v2 demo: capitalize each hyphen-separated command-name segment
 # via lex + native parse + span edits. Requires only `v2`, so it builds with
@@ -60,4 +51,3 @@ required-features = ["csharp"]
 name = "scope-rename"
 path = "examples/scope-rename.rs"
 required-features = ["v2"]
-
