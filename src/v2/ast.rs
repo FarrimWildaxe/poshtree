@@ -1,14 +1,10 @@
 //! The syntax tree produced by the native [`parse`](super::parser::parse).
 //!
-//! Unlike the `tree` module, which recovers token ranges from the v1
-//! parser, this tree is produced directly from v2 tokens and depends on no
-//! `v1` code. Every [`Node`] carries both a byte [`Span`] and a
-//! [`TokenRange`], so a node's exact source is `node.range` sliced from the
-//! token vector (or `node.span` sliced from the source string).
-//!
-//! Node labels match v1's `AstNode` names where a construct exists in both,
-//! which lets the correlation tree act as a differential-testing oracle
-//! during the migration.
+//! The parser builds this tree directly from v2 tokens. Each [`Node`] has a
+//! byte [`Span`] into the original source and a [`TokenRange`] into the
+//! parser's token vector. Interpolation nodes inside string tokens can have
+//! empty token ranges. These coordinates are not the trivia-inclusive
+//! footprints of the former token-correlation bridge.
 
 use super::span::{Span, TokenRange};
 
@@ -48,8 +44,8 @@ pub struct CSharpImport {
     pub params: Vec<CSharpParam>,
 }
 
-/// The C# member/type definition handed to `Add-Type`, extracted from the
-/// command's string argument. Mirrors v1's `CSharpMemberDef`.
+/// The C# member/type definition extracted from an eligible `Add-Type` string
+/// argument or a supported cached variable assignment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CSharpMemberDef {
     /// The raw C# source.
@@ -115,7 +111,7 @@ pub enum NodeKind {
         invocation: bool,
         /// Arguments and parameters in source order.
         elements: Vec<Node>,
-        /// Redirections, kept separate from `elements` as in v1.
+        /// Redirections, kept separate from arguments and parameters.
         redirections: Vec<Node>,
         /// For `Add-Type`, the extracted C# member definition (a
         /// [`CSharpMemberDef`](NodeKind::CSharpMemberDef) node); `None`
@@ -428,8 +424,8 @@ pub enum NodeKind {
 }
 
 impl Node {
-    /// The v1-compatible label for this node, for debugging and differential
-    /// comparison.
+    /// The node kind's label for debugging and structural comparison.
+    /// Some labels retain the corresponding names from the former v1 AST.
     pub fn label(&self) -> &'static str {
         use NodeKind::*;
         match &self.kind {

@@ -1,6 +1,5 @@
-//! Operator-name classification shared by the v1 and v2 lexers (and consulted
-//! by the v2 parser), so the dash-word spelling rules live in one place
-//! instead of drifting across hand-kept tables.
+//! Operator-name classification for the v2 lexer and parser, so the dash-word
+//! spelling rules live in one place instead of drifting across hand-kept tables.
 
 /// The comparison operators that accept the `c`/`i` case-sensitivity prefix
 /// (`-ceq`, `-iLike`, ...), per about_Comparison_Operators and about_Split.

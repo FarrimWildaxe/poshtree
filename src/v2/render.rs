@@ -124,8 +124,8 @@ impl std::error::Error for DiagnosticRenderError {}
 /// formatter, and makes no guarantees about reparsing, runtime behavior, or
 /// executability. Rendering has bounded call depth and does not buffer the
 /// output; this does not guarantee bounded stack use when constructing or
-/// dropping arbitrary trees. Callers who need legacy behavior must choose the
-/// opt-in `v1` path explicitly; this writer never falls back to it.
+/// dropping arbitrary trees. This writer does not reproduce the former v1
+/// source dump's parse-error tolerance or emitted bytes.
 ///
 /// # Errors
 ///

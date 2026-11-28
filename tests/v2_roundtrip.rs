@@ -1,8 +1,8 @@
 //! Integration tests for the v2 invariant: reconstructing the token stream
 //! reproduces the input byte-for-byte, on well-formed and broken input
 //! alike. Plus a small codemod demo built on `lex` + `TextEdit`, since that
-//! pairing is the whole point of the module. Native classification and AST
-//! checks run without v1; the cross-version and bridge checks are opt-in.
+//! pairing is the whole point of the module, and checks for native
+//! classification and AST traversal.
 
 #![cfg(feature = "v2")]
 
@@ -149,30 +149,6 @@ fn broken_corpus_reports_errors() {
     }
 }
 
-/// v2 carries its own copies of the classification tables so it compiles
-/// without v1. This test is the sync lock: while both versions exist, the
-/// copies must stay equal (as sets; order is presentation). When v1 is
-/// removed, this test goes with it.
-#[cfg(feature = "v1")]
-#[test]
-fn classification_tables_match_v1() {
-    fn sorted<'a>(s: &[&'a str]) -> Vec<&'a str> {
-        let mut v = s.to_vec();
-        v.sort_unstable();
-        v
-    }
-    assert_eq!(
-        sorted(poshtree::v1::tokens::KEYWORDS),
-        sorted(poshtree::v2::tokens::KEYWORDS),
-        "v2 KEYWORDS drifted from v1"
-    );
-    assert_eq!(
-        sorted(poshtree::v1::tokens::NAMED_OPERATORS),
-        sorted(poshtree::v2::tokens::NAMED_OPERATORS),
-        "v2 NAMED_OPERATORS drifted from v1"
-    );
-}
-
 const DASH_CASES: &[(&str, TokenKind)] = &[
     ("-eq", TokenKind::Operator),
     ("-Eq", TokenKind::Operator),
@@ -220,27 +196,6 @@ fn native_keyword_classification_is_case_insensitive_and_word_exact() {
 fn native_dash_classification_matches_literal_token_kinds() {
     for &(word, kind) in DASH_CASES {
         assert_native_word_kind(word, kind);
-    }
-}
-
-/// Behavioral agreement beyond the base tables: both lexers also recognize
-/// case-prefixed operators such as `-iin`.
-#[cfg(feature = "v1")]
-#[test]
-fn dash_classification_agrees_with_v1() {
-    use poshtree::v1::tokens::TokenType;
-
-    for &(word, _) in DASH_CASES {
-        let v1_is_op = poshtree::tokenize(word)
-            .first()
-            .map(|t| t.ty == TokenType::Operator)
-            .unwrap();
-        let v2_is_op = lex(word)
-            .tokens
-            .first()
-            .map(|t| t.kind == TokenKind::Operator)
-            .unwrap();
-        assert_eq!(v1_is_op, v2_is_op, "v1 and v2 disagree on {word:?}");
     }
 }
 
@@ -451,59 +406,6 @@ fn spans_match_source_slices() {
     }
 }
 
-/// The token-retaining tree, end to end: walk typed AST nodes zipped with
-/// their token ranges, match `AstNode::Command` by variant (no string
-/// sniffing), use the ancestor path for context, and rewrite just the
-/// command-name token's span. Structure-aware, and still a minimal diff.
-#[cfg(feature = "v1")]
-#[test]
-fn tree_driven_codemod_rewrites_by_node() {
-    use poshtree::v1::ast::AstNode;
-    use poshtree::v2::tree::parse_with_tokens;
-
-    let src = "\
-# inventory
-$bios = Get-WmiObject Win32_BIOS   # keep
-Get-Process | Where-Object { $_.Name -eq 'x' }
-$os = get-wmiobject Win32_OperatingSystem
-";
-    let tree = parse_with_tokens(src);
-
-    let mut edits: Vec<TextEdit> = Vec::new();
-    let mut saw_pipeline_context = false;
-    tree.walk_zipped(&mut |ast, node, ancestors| {
-        if let AstNode::Command(c) = ast {
-            if c.name.eq_ignore_ascii_case("Get-WmiObject") {
-                let name_tok = &tree.tokens[node.range.first];
-                assert!(name_tok.value_eq_ci("Get-WmiObject"));
-                edits.push(TextEdit::replace(name_tok.span, "Get-CimInstance"));
-            }
-            if c.name == "Where-Object" {
-                saw_pipeline_context = ancestors.iter().any(|(_, n)| n.label == "Pipeline");
-            }
-        }
-    });
-    assert_eq!(
-        edits.len(),
-        2,
-        "two Get-WmiObject commands, found by variant"
-    );
-    assert!(saw_pipeline_context, "ancestors reported the pipeline");
-
-    let rewritten = apply_edits(src, &edits).unwrap();
-    assert_eq!(
-        rewritten,
-        "\
-# inventory
-$bios = Get-CimInstance Win32_BIOS   # keep
-Get-Process | Where-Object { $_.Name -eq 'x' }
-$os = Get-CimInstance Win32_OperatingSystem
-"
-    );
-    // the rewrite re-parses and is itself lossless
-    assert_eq!(parse_with_tokens(&rewritten).unparse_lossless(), rewritten);
-}
-
 #[test]
 fn native_codemod_rewrites_only_pipeline_command_names_by_span() {
     use poshtree::v2::{parse, NodeKind};
@@ -537,8 +439,7 @@ fn native_codemod_rewrites_only_pipeline_command_names_by_span() {
     );
 }
 
-/// The native v2 parser, used standalone (no v1): it parses, finds commands,
-/// and every node's span slices back to its own source.
+/// The native parser finds commands whose name spans slice back to the source.
 #[test]
 fn native_parser_extracts_commands_and_spans() {
     use poshtree::v2::parser::parse;
@@ -570,8 +471,7 @@ fn native_parser_extracts_commands_and_spans() {
     );
 }
 
-/// Both parser paths must independently find the literal command sets, so
-/// agreement cannot hide a shared omission or an argument mistaken for a call.
+/// Literal command sets catch omissions and arguments mistaken for calls.
 fn command_cases() -> [(&'static str, &'static [&'static str]); 9] {
     [
         (
@@ -642,31 +542,6 @@ fn native_parser_matches_literal_commands() {
 
         native.sort();
         assert_eq!(native, expected, "native commands for {src:?}");
-    }
-}
-
-#[cfg(feature = "v1")]
-#[test]
-fn correlation_tree_matches_literal_commands() {
-    use poshtree::v1::ast::AstNode;
-    use poshtree::v2::tree::parse_with_tokens;
-
-    for (src, expected) in command_cases() {
-        assert_correlated_commands(src, expected);
-    }
-
-    fn assert_correlated_commands(src: &str, expected: &[&str]) {
-        let tree = parse_with_tokens(src);
-
-        let mut correlated: Vec<String> = Vec::new();
-        tree.walk_zipped(&mut |ast, _, _| {
-            if let AstNode::Command(c) = ast {
-                correlated.push(c.name.to_ascii_lowercase());
-            }
-        });
-
-        correlated.sort();
-        assert_eq!(correlated, expected, "correlated commands for {src:?}");
     }
 }
 

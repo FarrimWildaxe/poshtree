@@ -1,28 +1,21 @@
-//! The v2 token: a v1-style kind, the exact source text, a byte span, and
+//! The v2 token: a syntactic kind, the exact source text, a byte span, and
 //! the trivia that surrounds it.
 //!
-//! [`TokenKind`] keeps the categories of v1's `TokenType` so
-//! a parser port stays mechanical, with three deliberate changes:
+//! Several token kinds were inherited from the former v1 lexer, but the
+//! native token stream and payloads are different:
 //!
-//! * `Newline` and `Comment` are gone; both are [`Trivia`] now. Statement
-//!   separation, which the v1 parser reads from `Newline` tokens, becomes a
-//!   check on [`Token::starts_line`].
-//! * `VerbatimArgs` is new: the raw remainder of a line after the `--%`
-//!   stop-parsing operator, where nothing (not even `#`) has its usual
-//!   meaning. The v1 parser reconstructs this by re-slicing the source;
-//!   in v2 the lexer hands it over directly.
-//! * Token text is stored verbatim, original casing included, in `value`,
-//!   the same field name v1 uses for raw text. v2 carries no decoded
-//!   payloads (v1's `text`, `scope`, `splat`): decoding loses bytes, and
-//!   byte fidelity is the whole point of this layer. A v2 parser derives
-//!   those on demand.
+//! * Newlines and comments are [`Trivia`], not significant tokens. Check
+//!   [`Token::starts_line`] and [`Token::ends_line`] for unescaped line breaks.
+//! * [`TokenKind::VerbatimArgs`] holds the raw remainder of a line after `--%`,
+//!   where even `#` does not start a comment.
+//! * `value` keeps the raw token spelling, including original casing. Decoded
+//!   values are derived by the parser rather than stored on lexer tokens.
 
 use super::span::Span;
 use super::trivia::{Trivia, TriviaKind};
 use std::fmt;
 
-/// Syntactic category of a token. Mirrors v1's `TokenType` minus the trivia
-/// kinds, so existing `match` arms in the parser translate one-to-one.
+/// Syntactic category of a significant token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TokenKind {
     // Literals
@@ -105,8 +98,7 @@ impl fmt::Display for TokenKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
     pub kind: TokenKind,
-    /// Exact source text of the token itself, trivia excluded. Same role
-    /// (and name) as `value` on the v1 token.
+    /// Exact source text of the token itself, trivia excluded.
     pub value: String,
     /// Byte span of `value` in the original source.
     pub span: Span,
@@ -147,9 +139,6 @@ impl Token {
         self.trailing.iter().find(|t| t.is_comment())
     }
 
-    /// True when a line break (newline or backtick continuation) occurs in
-    /// the leading trivia, i.e. the token starts a new physical line. This
-    /// is the v2 replacement for testing against v1 `Newline` tokens.
     /// True when a real (unescaped) line break sits in this token's leading
     /// trivia, so the token opens a new physical line. A backtick
     /// continuation (`` ` `` then a newline) deliberately does not count: it
@@ -180,8 +169,7 @@ impl Token {
 
 /// A recoverable problem found while lexing. The lexer never panics and
 /// never stops: the affected text still lands in a token (or trivia) so the
-/// byte-for-byte invariant holds even for malformed input. Same posture as
-/// the v1 parser's error nodes.
+/// byte-for-byte invariant holds even for malformed input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LexError {
     pub span: Span,
@@ -195,14 +183,6 @@ impl fmt::Display for LexError {
 }
 
 impl std::error::Error for LexError {}
-
-// Classification tables
-//
-// These are byte-for-byte copies of the v1 tables rather than imports, so
-// `v2` compiles and works without `v1` present; the native v2 parser builds
-// on them, and deleting `v1` will not touch this file. While both versions
-// still exist, an integration test (`classification_tables_match_v1`) keeps
-// the copies equal, so the two lexers agree on every keyword and dash-word.
 
 /// Named operators, compared case-insensitively, without the leading hyphen.
 /// Base names only: the `c`/`i` case-prefixed comparison spellings (`ceq`,
